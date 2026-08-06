@@ -100,9 +100,19 @@ can prevent the dash from connecting.
 
 The QSPI dash firmware also has an on-screen settings scan. Tap the cog in the
 top-right corner to scan nearby BLE devices. Tap `SCAN` to rescan or the
-top-left back button to cancel any active scan and return to the dash. If touch
-calibration needs work, use serial commands while monitoring at 115200 baud:
+top-left back button to cancel any active scan and return to the dash.
+
+Many BLE devices do not advertise a friendly name. To identify a BM6, scan once
+with the spare BM6 unpowered, then power the BM6 from a 12 V bench supply and
+scan again. The new or strongest nearby unnamed device is usually the BM6. Tap a
+device row to test it with the BM6 read command. If the read succeeds, the dash
+saves that address and uses it for future polling. Rows with obvious medical
+device names such as pumps or Dexcom are shown but skipped by the test action.
+
+If touch calibration needs work, use serial commands while monitoring at 115200
+baud:
 
 - `s` opens settings and scans
 - `r` rescans while on the settings screen
 - `d` returns to the dash
+- `1` through `9` tests that numbered scan row as a BM6

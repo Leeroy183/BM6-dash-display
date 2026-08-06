@@ -20,6 +20,10 @@ class Bm6Client {
   public:
     void begin();
     Bm6PollResult poll(BatteryReading &reading);
+    Bm6PollResult pollAddress(const char *address, uint8_t addressType, BatteryReading &reading);
+    void setPreferredAddress(const char *address, uint8_t addressType);
+    const char *preferredAddress() const;
+    uint8_t preferredAddressType() const;
     const char *lastDeviceAddress() const;
     int lastRssi() const;
 
@@ -27,6 +31,7 @@ class Bm6Client {
     class ScanCallbacks;
 
     bool findDevice(NimBLEAddress &address, int &rssi);
+    Bm6PollResult pollResolvedAddress(const NimBLEAddress &address, int rssi, BatteryReading &reading);
     bool packetToReading(const uint8_t *encrypted, size_t length, BatteryReading &reading) const;
     void handleNotification(uint8_t *data, size_t length);
 
@@ -36,5 +41,7 @@ class Bm6Client {
     NimBLEAddress foundAddress_;
     int foundRssi_ = 0;
     char lastAddress_[18] = "";
+    char preferredAddress_[18] = "";
+    uint8_t preferredAddressType_ = 1;
     uint8_t encryptedPacket_[16] = {};
 };

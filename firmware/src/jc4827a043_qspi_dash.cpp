@@ -1,8 +1,10 @@
 #include <Arduino.h>
 #include <Arduino_GFX_Library.h>
 #include <NimBLEDevice.h>
+#include <Preferences.h>
 #include <Wire.h>
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <string>
@@ -137,6 +139,7 @@ struct BleScanDevice {
     char address[18] = "";
     char name[24] = "";
     int rssi = -127;
+    uint8_t addressType = 1;
     bool bm6Service = false;
 };
 
@@ -148,6 +151,7 @@ enum class Screen {
 Bm6Client bm6;
 PersistentHistory history;
 Gt911Touch touch;
+Preferences configPrefs;
 BatteryReading latestReading;
 BleScanDevice scanDevices[MAX_SCAN_DEVICES];
 portMUX_TYPE scanDevicesMux = portMUX_INITIALIZER_UNLOCKED;
@@ -189,6 +193,7 @@ class SettingsScanCallbacks : public NimBLEScanCallbacks {
         }
 
         slot->rssi = device->getRSSI();
+        slot->addressType = device->getAddress().getType();
         slot->bm6Service = device->isAdvertisingService(NimBLEUUID("0000fff0-0000-1000-8000-00805f9b34fb"));
         if (device->haveName()) {
             std::strncpy(slot->name, device->getName().c_str(), sizeof(slot->name) - 1);
@@ -211,6 +216,37 @@ class SettingsScanCallbacks : public NimBLEScanCallbacks {
 };
 
 SettingsScanCallbacks settingsScanCallbacks;
+
+void stopSettingsScan();
+
+bool containsInsensitive(const char *text, const char *needle)
+{
+    if (text == nullptr || needle == nullptr || needle[0] == '\0') {
+        return false;
+    }
+
+    const size_t needleLength = std::strlen(needle);
+    for (const char *cursor = text; *cursor != '\0'; ++cursor) {
+        size_t i = 0;
+        while (i < needleLength && cursor[i] != '\0' &&
+               std::tolower(static_cast<unsigned char>(cursor[i])) ==
+                   std::tolower(static_cast<unsigned char>(needle[i]))) {
+            ++i;
+        }
+        if (i == needleLength) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool shouldSkipDeviceTest(const BleScanDevice &device)
+{
+    return containsInsensitive(device.name, "pump") ||
+           containsInsensitive(device.name, "dexcom") ||
+           containsInsensitive(device.name, "dxcm") ||
+           containsInsensitive(device.name, "omnipod");
+}
 
 uint16_t voltageColor(float voltage)
 {
@@ -438,18 +474,23 @@ void drawSettingsHeader()
     gfx->print("SCAN");
 }
 
-void drawScanResults()
+void copySortedScanDevices(BleScanDevice *devices, uint8_t &deviceCount)
 {
-    BleScanDevice devices[MAX_SCAN_DEVICES];
-    uint8_t deviceCount = 0;
     portENTER_CRITICAL(&scanDevicesMux);
     deviceCount = scanDeviceCount;
-    std::memcpy(devices, scanDevices, sizeof(devices));
+    std::memcpy(devices, scanDevices, sizeof(scanDevices));
     portEXIT_CRITICAL(&scanDevicesMux);
 
     std::sort(devices, devices + deviceCount, [](const BleScanDevice &a, const BleScanDevice &b) {
         return a.rssi > b.rssi;
     });
+}
+
+void drawScanResults()
+{
+    BleScanDevice devices[MAX_SCAN_DEVICES];
+    uint8_t deviceCount = 0;
+    copySortedScanDevices(devices, deviceCount);
 
     clearTextArea(12, 66, 456, 198);
     gfx->setTextSize(1);
@@ -463,7 +504,8 @@ void drawScanResults()
     for (uint8_t i = 0; i < deviceCount; ++i) {
         const int y = 72 + i * 18;
         clearTextArea(18, y, 438, 12);
-        gfx->setTextColor(devices[i].bm6Service ? COLOR_GREEN : COLOR_WHITE, COLOR_BLACK);
+        const bool skipped = shouldSkipDeviceTest(devices[i]);
+        gfx->setTextColor(devices[i].bm6Service ? COLOR_GREEN : (skipped ? COLOR_AMBER : COLOR_WHITE), COLOR_BLACK);
         gfx->setCursor(18, y);
         gfx->printf("%s", devices[i].address);
         gfx->setTextColor(COLOR_MUTED, COLOR_BLACK);
@@ -476,8 +518,83 @@ void drawScanResults()
             gfx->setTextColor(COLOR_GREEN, COLOR_BLACK);
             gfx->setCursor(390, y);
             gfx->print("BM6");
+        } else if (skipped) {
+            gfx->setTextColor(COLOR_AMBER, COLOR_BLACK);
+            gfx->setCursor(390, y);
+            gfx->print("SKIP");
         }
     }
+}
+
+bool scanDeviceAtPoint(const TouchPoint &point, BleScanDevice &device)
+{
+    if (point.y < 72 || point.y >= 252) {
+        return false;
+    }
+
+    const uint8_t row = static_cast<uint8_t>((point.y - 72) / 18);
+    BleScanDevice devices[MAX_SCAN_DEVICES];
+    uint8_t deviceCount = 0;
+    copySortedScanDevices(devices, deviceCount);
+    if (row >= deviceCount) {
+        return false;
+    }
+
+    device = devices[row];
+    return true;
+}
+
+bool scanDeviceAtRow(uint8_t row, BleScanDevice &device)
+{
+    BleScanDevice devices[MAX_SCAN_DEVICES];
+    uint8_t deviceCount = 0;
+    copySortedScanDevices(devices, deviceCount);
+    if (row >= deviceCount) {
+        return false;
+    }
+
+    device = devices[row];
+    return true;
+}
+
+void saveSelectedBm6(const BleScanDevice &device)
+{
+    configPrefs.putString("addr", device.address);
+    configPrefs.putUChar("atype", device.addressType);
+    bm6.setPreferredAddress(device.address, device.addressType);
+}
+
+void testSelectedDevice(const BleScanDevice &device)
+{
+    stopSettingsScan();
+    drawSettingsStatus("Testing selected device as BM6...");
+
+    if (shouldSkipDeviceTest(device)) {
+        drawSettingsStatus("Skipped named medical device");
+        Serial.printf("Skipped BLE test for %s name=\"%s\"\n", device.address, device.name);
+        return;
+    }
+
+    BatteryReading reading;
+    const Bm6PollResult result = bm6.pollAddress(device.address, device.addressType, reading);
+    if (result != Bm6PollResult::Ok) {
+        char buffer[64];
+        snprintf(buffer, sizeof(buffer), "Not BM6: %s", pollResultText(result));
+        drawSettingsStatus(buffer);
+        Serial.printf("BM6 test failed for %s: %s\n", device.address, pollResultText(result));
+        return;
+    }
+
+    saveSelectedBm6(device);
+    latestReading = reading;
+    haveReading = true;
+    history.addIfDue(reading);
+
+    char buffer[64];
+    snprintf(buffer, sizeof(buffer), "Saved BM6 %s %.2fV", device.address, reading.voltage);
+    drawSettingsStatus(buffer);
+    Serial.printf("Saved BM6 %s type %u %.2fV %u%% %dC\n",
+                  device.address, device.addressType, reading.voltage, reading.socPercent, reading.temperatureC);
 }
 
 void stopSettingsScan()
@@ -561,7 +678,7 @@ void serviceSettingsScan()
     if (!settingsScanActive && scanResultsDirty) {
         NimBLEDevice::getScan()->setScanCallbacks(nullptr, false);
         NimBLEDevice::getScan()->setMaxResults(0xff);
-        drawSettingsStatus("Tap SCAN to rescan, Back to return");
+        drawSettingsStatus("Tap row to test BM6, SCAN to rescan");
         drawScanResults();
         scanResultsDirty = false;
         uint8_t deviceCount = 0;
@@ -615,6 +732,12 @@ void handleTouchTap(const TouchPoint &point)
     }
     if (currentScreen == Screen::Settings && point.x >= 352 && point.y <= 44) {
         beginSettingsScan();
+        return;
+    }
+
+    BleScanDevice selected;
+    if (currentScreen == Screen::Settings && scanDeviceAtPoint(point, selected)) {
+        testSelectedDevice(selected);
     }
 }
 
@@ -644,6 +767,11 @@ void handleSerial()
         redrawAll();
     } else if (command == 'r' && currentScreen == Screen::Settings) {
         beginSettingsScan();
+    } else if (command >= '1' && command <= '9' && currentScreen == Screen::Settings) {
+        BleScanDevice selected;
+        if (scanDeviceAtRow(static_cast<uint8_t>(command - '1'), selected)) {
+            testSelectedDevice(selected);
+        }
     }
 }
 } // namespace
@@ -669,6 +797,16 @@ void setup()
     history.latest(latestReading);
     haveReading = history.size() > 0;
     redrawAll();
+
+    configPrefs.begin("bm6cfg", false);
+    if (configPrefs.isKey("addr")) {
+        const String savedAddress = configPrefs.getString("addr", "");
+        if (savedAddress.length() == 17) {
+            const uint8_t savedAddressType = configPrefs.getUChar("atype", 1);
+            bm6.setPreferredAddress(savedAddress.c_str(), savedAddressType);
+            Serial.printf("Loaded saved BM6 %s type %u\n", savedAddress.c_str(), savedAddressType);
+        }
+    }
 
     bm6.begin();
     pollBm6Now();

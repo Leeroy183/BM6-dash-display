@@ -23,9 +23,9 @@ constexpr uint8_t READ_COMMAND[16] = {
     0xab, 0x1c, 0x0a, 0xf6, 0xfd, 0xe8, 0x14, 0x14
 };
 
-bool hasConfiguredAddress()
+bool hasAddress(const char *address)
 {
-    return std::strcmp(BM6_MAC_ADDRESS, "00:00:00:00:00:00") != 0;
+    return address[0] != '\0' && std::strcmp(address, "00:00:00:00:00:00") != 0;
 }
 
 std::string lowerCopy(std::string value)
@@ -44,11 +44,13 @@ class Bm6Client::ScanCallbacks : public NimBLEScanCallbacks {
     void onResult(const NimBLEAdvertisedDevice *device) override
     {
         const std::string address = lowerCopy(device->getAddress().toString());
-        const std::string configured = lowerCopy(BM6_MAC_ADDRESS);
-        const bool addressMatches = hasConfiguredAddress() && address == configured;
-        const bool nameMatches = !hasConfiguredAddress() && device->haveName() &&
+        const char *target = hasAddress(client_.preferredAddress_) ? client_.preferredAddress_ : BM6_MAC_ADDRESS;
+        const bool targetConfigured = hasAddress(target);
+        const std::string configured = lowerCopy(target);
+        const bool addressMatches = targetConfigured && address == configured;
+        const bool nameMatches = !targetConfigured && device->haveName() &&
                                  device->getName() == BM6_ADVERTISED_NAME;
-        const bool serviceMatches = !hasConfiguredAddress() && device->isAdvertisingService(BM6_SERVICE_UUID);
+        const bool serviceMatches = !targetConfigured && device->isAdvertisingService(BM6_SERVICE_UUID);
 
         if (!addressMatches && !nameMatches && !serviceMatches) {
             return;
@@ -58,6 +60,7 @@ class Bm6Client::ScanCallbacks : public NimBLEScanCallbacks {
         client_.foundRssi_ = device->getRSSI();
         client_.found_ = true;
         std::strncpy(client_.lastAddress_, device->getAddress().toString().c_str(), sizeof(client_.lastAddress_) - 1);
+        client_.lastAddress_[sizeof(client_.lastAddress_) - 1] = '\0';
         device->getScan()->stop();
     }
 
@@ -86,6 +89,45 @@ Bm6PollResult Bm6Client::poll(BatteryReading &reading)
         return Bm6PollResult::NotFound;
     }
 
+    return pollResolvedAddress(address, rssi, reading);
+}
+
+Bm6PollResult Bm6Client::pollAddress(const char *address, uint8_t addressType, BatteryReading &reading)
+{
+    if (!hasAddress(address)) {
+        return Bm6PollResult::NotFound;
+    }
+
+    begin();
+    NimBLEAddress target(std::string(address), addressType);
+    return pollResolvedAddress(target, 0, reading);
+}
+
+void Bm6Client::setPreferredAddress(const char *address, uint8_t addressType)
+{
+    if (!hasAddress(address)) {
+        preferredAddress_[0] = '\0';
+        preferredAddressType_ = 1;
+        return;
+    }
+
+    std::strncpy(preferredAddress_, address, sizeof(preferredAddress_) - 1);
+    preferredAddress_[sizeof(preferredAddress_) - 1] = '\0';
+    preferredAddressType_ = addressType;
+}
+
+const char *Bm6Client::preferredAddress() const
+{
+    return preferredAddress_;
+}
+
+uint8_t Bm6Client::preferredAddressType() const
+{
+    return preferredAddressType_;
+}
+
+Bm6PollResult Bm6Client::pollResolvedAddress(const NimBLEAddress &address, int rssi, BatteryReading &reading)
+{
     NimBLEClient *client = NimBLEDevice::createClient();
     if (client == nullptr) {
         return Bm6PollResult::ConnectFailed;
@@ -144,6 +186,10 @@ Bm6PollResult Bm6Client::poll(BatteryReading &reading)
 
     if (client->isConnected()) {
         client->disconnect();
+    }
+    if (result == Bm6PollResult::Ok) {
+        std::strncpy(lastAddress_, address.toString().c_str(), sizeof(lastAddress_) - 1);
+        lastAddress_[sizeof(lastAddress_) - 1] = '\0';
     }
     NimBLEDevice::deleteClient(client);
     return result;

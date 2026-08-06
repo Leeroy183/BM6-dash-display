@@ -22,7 +22,7 @@
 
 - [x] add a settings cog target on the QSPI dash
 - [x] scan and list nearby BLE devices on the display
-- [ ] persist a selected BM6 address from the settings screen
+- [x] persist a selected BM6 address from the settings screen
 - [ ] add touch calibration if the tap coordinates are rotated or offset
 
 ## Multi-battery support
