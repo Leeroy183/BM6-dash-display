@@ -1,15 +1,16 @@
 #include <Arduino.h>
 #include <Arduino_GFX_Library.h>
 #include <NimBLEDevice.h>
-#include <Preferences.h>
 #include <Wire.h>
 #include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstring>
+#include <strings.h>
 #include <string>
 #include "Bm6Client.h"
 #include "PersistentHistory.h"
+#include "SavedBm6Registry.h"
 #include "config.h"
 
 namespace {
@@ -21,8 +22,10 @@ constexpr int TOUCH_INT = 3;
 constexpr int SCREEN_WIDTH = 480;
 constexpr int SCREEN_HEIGHT = 272;
 constexpr uint16_t COLOR_BLACK = 0x0000;
+constexpr uint16_t COLOR_BACKGROUND = 0x0861;
 constexpr uint16_t COLOR_WHITE = 0xffff;
-constexpr uint16_t COLOR_PANEL = 0x2104;
+constexpr uint16_t COLOR_PANEL = 0x18e3;
+constexpr uint16_t COLOR_PANEL_LIGHT = 0x2945;
 constexpr uint16_t COLOR_MUTED = 0x9cf3;
 constexpr uint16_t COLOR_GREEN = 0x07e0;
 constexpr uint16_t COLOR_AMBER = 0xfd20;
@@ -33,7 +36,7 @@ constexpr uint8_t GT911_ADDR_1 = 0x5d;
 constexpr uint8_t GT911_ADDR_2 = 0x14;
 constexpr uint16_t GT911_POINT_STATUS = 0x814e;
 constexpr uint8_t MAX_SCAN_DEVICES = 32;
-constexpr uint8_t SETTINGS_ROWS_PER_PAGE = 9;
+constexpr uint8_t SETTINGS_ROWS_PER_PAGE = 7;
 
 Arduino_DataBus *bus = new Arduino_ESP32QSPI(
     45 /* CS */, 47 /* SCK */, 21 /* D0 */, 48 /* D1 */, 40 /* D2 */, 39 /* D3 */
@@ -151,10 +154,22 @@ enum class Screen {
     Settings
 };
 
+enum class DashPage : uint8_t {
+    Overview,
+    History,
+    Tests
+};
+
+enum class HistoryRange : uint8_t {
+    SixHours,
+    OneDay,
+    ThreeDays
+};
+
 Bm6Client bm6;
 PersistentHistory history;
+SavedBm6Registry registry;
 Gt911Touch touch;
-Preferences configPrefs;
 BatteryReading latestReading;
 BleScanDevice scanDevices[MAX_SCAN_DEVICES];
 portMUX_TYPE scanDevicesMux = portMUX_INITIALIZER_UNLOCKED;
@@ -173,6 +188,9 @@ uint32_t lastUiTickMs = 0;
 uint32_t lastChartDrawMs = 0;
 char currentStatus[36] = "Starting";
 Screen currentScreen = Screen::Dash;
+DashPage dashPage = DashPage::Overview;
+HistoryRange historyRange = HistoryRange::ThreeDays;
+uint8_t consecutivePollFailures = 0;
 
 class SettingsScanCallbacks : public NimBLEScanCallbacks {
   public:
@@ -281,6 +299,17 @@ bool isNewThisScan(const BleScanDevice &device)
     return settingsScanGeneration > 1 && device.firstSeenScan == settingsScanGeneration;
 }
 
+int8_t savedDeviceIndex(const char *address)
+{
+    for (uint8_t i = 0; i < registry.count(); ++i) {
+        const SavedBm6Device *saved = registry.device(i);
+        if (saved != nullptr && strcasecmp(saved->address, address) == 0) {
+            return static_cast<int8_t>(i);
+        }
+    }
+    return -1;
+}
+
 uint16_t voltageColor(float voltage)
 {
     if (voltage < BATTERY_CRITICAL_VOLTS) {
@@ -338,136 +367,327 @@ void drawGearIcon(int cx, int cy, uint16_t color)
 
 void drawCogButton()
 {
-    gfx->drawRoundRect(438, 4, 34, 34, 6, COLOR_MUTED);
+    gfx->drawRoundRect(438, 4, 34, 34, 6, COLOR_PANEL_LIGHT);
     drawGearIcon(455, 21, COLOR_WHITE);
 }
 
-void drawStaticLayout()
+const char *activeBatteryName()
 {
-    gfx->fillScreen(COLOR_BLACK);
-    gfx->setTextColor(COLOR_WHITE, COLOR_BLACK);
-    gfx->setTextSize(2);
-    gfx->setCursor(14, 12);
-    gfx->print("BM6 Dash Display");
-    drawCogButton();
+    const SavedBm6Device *device = registry.active();
+    return device == nullptr ? "No battery" : device->name;
+}
 
-    gfx->drawRoundRect(12, 42, 456, 104, 8, COLOR_MUTED);
-    gfx->drawRoundRect(12, 158, 456, 92, 8, COLOR_MUTED);
+size_t historySamplesForRange()
+{
+    switch (historyRange) {
+        case HistoryRange::SixHours:
+            return 6UL * 60UL / 5UL;
+        case HistoryRange::OneDay:
+            return 24UL * 60UL / 5UL;
+        case HistoryRange::ThreeDays:
+            return HISTORY_CAPACITY;
+    }
+    return HISTORY_CAPACITY;
+}
+
+const char *historyRangeLabel()
+{
+    switch (historyRange) {
+        case HistoryRange::SixHours:
+            return "LAST 6 HOURS";
+        case HistoryRange::OneDay:
+            return "LAST 24 HOURS";
+        case HistoryRange::ThreeDays:
+            return "LAST 3 DAYS";
+    }
+    return "HISTORY";
+}
+
+void drawHeader()
+{
+    gfx->fillRect(0, 0, SCREEN_WIDTH, 42, COLOR_PANEL);
+    const bool multiple = registry.count() > 1;
+    gfx->setTextSize(2);
+    gfx->setTextColor(multiple ? COLOR_WHITE : COLOR_MUTED, COLOR_PANEL);
+    gfx->setCursor(10, 13);
+    gfx->print(multiple ? "<" : " ");
+    gfx->setCursor(211, 13);
+    gfx->print(multiple ? ">" : " ");
+
+    gfx->setTextColor(COLOR_WHITE, COLOR_PANEL);
+    gfx->setCursor(36, 8);
+    gfx->printf("%.15s", activeBatteryName());
     gfx->setTextSize(1);
-    gfx->setTextColor(COLOR_MUTED, COLOR_BLACK);
-    gfx->setCursor(24, 52);
-    gfx->print("BATTERY");
-    gfx->setCursor(24, 168);
-    gfx->print("3 DAY VOLTAGE HISTORY");
+    gfx->setTextColor(COLOR_MUTED, COLOR_PANEL);
+    gfx->setCursor(38, 27);
+    const SavedBm6Device *device = registry.active();
+    if (device != nullptr) {
+        gfx->printf("...%s  %u/%u", device->address + 12,
+                    static_cast<unsigned>(registry.activeIndex() + 1),
+                    static_cast<unsigned>(registry.count()));
+    } else {
+        gfx->print("Tap settings to add BM6");
+    }
+    drawCogButton();
 }
 
 void drawStatus()
 {
-    clearTextArea(250, 10, 184, 18);
+    clearTextArea(240, 5, 194, 32, COLOR_PANEL);
     gfx->setTextSize(1);
-    gfx->setTextColor(COLOR_MUTED, COLOR_BLACK);
-    gfx->setCursor(250, 14);
-    gfx->print(currentStatus);
+    const uint16_t color = std::strcmp(currentStatus, "BM6 connected") == 0 ? COLOR_GREEN : COLOR_MUTED;
+    gfx->fillCircle(248, 21, 3, color);
+    gfx->setTextColor(color, COLOR_PANEL);
+    gfx->setCursor(257, 17);
+    gfx->printf("%.22s", currentStatus);
 }
 
-void drawNoReading()
+void drawNavigation()
 {
-    clearTextArea(24, 70, 420, 54);
-    gfx->setTextSize(3);
-    gfx->setTextColor(COLOR_MUTED, COLOR_BLACK);
-    gfx->setCursor(24, 78);
-    gfx->print("--.-- V");
-}
-
-void drawLatestReading()
-{
-    if (!haveReading) {
-        drawNoReading();
-        return;
+    constexpr int y = 238;
+    constexpr int tabWidth = 160;
+    gfx->fillRect(0, y, SCREEN_WIDTH, SCREEN_HEIGHT - y, COLOR_PANEL);
+    for (uint8_t i = 0; i < 3; ++i) {
+        const bool active = static_cast<uint8_t>(dashPage) == i;
+        if (active) {
+            gfx->fillRoundRect(i * tabWidth + 4, y + 3, tabWidth - 8, 28, 6, COLOR_PANEL_LIGHT);
+        }
     }
 
-    clearTextArea(24, 70, 210, 50);
-    gfx->setTextSize(4);
-    gfx->setTextColor(voltageColor(latestReading.voltage), COLOR_BLACK);
-    gfx->setCursor(24, 72);
-    gfx->printf("%.2fV", latestReading.voltage);
-
-    clearTextArea(250, 62, 190, 72);
-    gfx->setTextSize(2);
-    gfx->setTextColor(COLOR_WHITE, COLOR_BLACK);
-    gfx->setCursor(250, 68);
-    gfx->printf("SOC %u%%", latestReading.socPercent);
-    gfx->setCursor(250, 96);
-    gfx->printf("TEMP %dC", latestReading.temperatureC);
     gfx->setTextSize(1);
-    gfx->setTextColor(COLOR_MUTED, COLOR_BLACK);
-    gfx->setCursor(250, 122);
-    gfx->printf("RSSI %d dBm", latestReading.rssi);
+    gfx->setTextColor(dashPage == DashPage::Overview ? COLOR_GREEN : COLOR_MUTED,
+                      dashPage == DashPage::Overview ? COLOR_PANEL_LIGHT : COLOR_PANEL);
+    gfx->setCursor(56, 251);
+    gfx->print("OVERVIEW");
+    gfx->setTextColor(dashPage == DashPage::History ? COLOR_GREEN : COLOR_MUTED,
+                      dashPage == DashPage::History ? COLOR_PANEL_LIGHT : COLOR_PANEL);
+    gfx->setCursor(220, 251);
+    gfx->print("HISTORY");
+    gfx->setTextColor(dashPage == DashPage::Tests ? COLOR_GREEN : COLOR_MUTED,
+                      dashPage == DashPage::Tests ? COLOR_PANEL_LIGHT : COLOR_PANEL);
+    gfx->setCursor(382, 251);
+    gfx->print("TESTS");
 }
 
-void drawFooter()
+void drawChart(int x0, int y0, int w, int h, size_t recentSamples, bool grid)
 {
-    clearTextArea(18, 252, 448, 16);
-    gfx->setTextSize(1);
-    gfx->setTextColor(COLOR_MUTED, COLOR_BLACK);
-    gfx->setCursor(18, 256);
-    const uint32_t remainingMs = static_cast<int32_t>(nextPollAtMs - millis()) > 0 ? nextPollAtMs - millis() : 0;
-    gfx->printf("Samples %u/%u | Next poll %lus",
-                static_cast<unsigned>(history.size()), static_cast<unsigned>(HISTORY_CAPACITY),
-                static_cast<unsigned long>((remainingMs + 999) / 1000));
-}
-
-void drawHistoryChart()
-{
-    constexpr int x0 = 24;
-    constexpr int y0 = 184;
-    constexpr int w = 432;
-    constexpr int h = 48;
-    clearTextArea(x0, y0 - 8, w, h + 18, COLOR_BLACK);
+    gfx->fillRect(x0, y0, w, h, COLOR_PANEL_LIGHT);
     gfx->drawRect(x0, y0, w, h, COLOR_MUTED);
+    if (grid) {
+        for (uint8_t i = 1; i < 4; ++i) {
+            const int y = y0 + i * h / 4;
+            gfx->drawFastHLine(x0 + 1, y, w - 2, COLOR_PANEL);
+        }
+        for (uint8_t i = 1; i < 6; ++i) {
+            const int x = x0 + i * w / 6;
+            gfx->drawFastVLine(x, y0 + 1, h - 2, COLOR_PANEL);
+        }
+    }
 
     if (history.size() == 0) {
         gfx->setTextSize(1);
-        gfx->setTextColor(COLOR_MUTED, COLOR_BLACK);
-        gfx->setCursor(x0 + 12, y0 + 18);
-        gfx->print("Waiting for first history sample");
+        gfx->setTextColor(COLOR_MUTED, COLOR_PANEL_LIGHT);
+        gfx->setCursor(x0 + 12, y0 + h / 2 - 4);
+        gfx->print("WAITING FOR HISTORY");
         return;
     }
 
-    const int minCenti = std::max(1050, static_cast<int>(std::floor((history.minVoltage() - 0.15f) * 100.0f)));
-    const int maxCenti = std::max(minCenti + 60, std::min(1500, static_cast<int>(std::ceil((history.maxVoltage() + 0.15f) * 100.0f))));
+    const int minCenti = std::max(900, static_cast<int>(std::floor((history.minVoltage(recentSamples) - 0.15f) * 100.0f)));
+    const int maxCenti = std::max(minCenti + 60, std::min(1600, static_cast<int>(std::ceil((history.maxVoltage(recentSamples) + 0.15f) * 100.0f))));
     int lastX = -1;
     int lastY = -1;
-    for (int x = 0; x < w; ++x) {
-        const int value = history.voltageHundredthsForChart(x, w);
+    for (int x = 0; x < w - 2; ++x) {
+        const int value = history.voltageHundredthsForChart(x, w - 2, recentSamples);
         if (value < 0) {
             continue;
         }
         const int clamped = std::max(minCenti, std::min(maxCenti, value));
-        const int y = y0 + h - 1 - ((clamped - minCenti) * (h - 2) / (maxCenti - minCenti));
+        const int y = y0 + h - 2 - ((clamped - minCenti) * (h - 4) / (maxCenti - minCenti));
         if (lastX >= 0) {
-            gfx->drawLine(lastX, lastY, x0 + x, y, COLOR_GREEN);
+            gfx->drawLine(lastX, lastY, x0 + 1 + x, y, COLOR_GREEN);
         }
-        lastX = x0 + x;
+        lastX = x0 + 1 + x;
         lastY = y;
     }
-
-    gfx->setTextSize(1);
-    gfx->setTextColor(COLOR_MUTED, COLOR_BLACK);
-    gfx->setCursor(x0, y0 + h + 4);
-    gfx->printf("%.2f-%.2fV", minCenti / 100.0f, maxCenti / 100.0f);
-    gfx->setCursor(x0 + 346, y0 + h + 4);
-    gfx->print("last 3 days");
 }
 
-void redrawAll()
+void drawOverview()
+{
+    gfx->fillRect(0, 42, SCREEN_WIDTH, 196, COLOR_BACKGROUND);
+    gfx->fillRoundRect(8, 49, 194, 180, 6, COLOR_PANEL_LIGHT);
+    gfx->fillRoundRect(210, 49, 262, 76, 6, COLOR_PANEL_LIGHT);
+
+    gfx->setTextSize(1);
+    gfx->setTextColor(COLOR_MUTED, COLOR_PANEL_LIGHT);
+    gfx->setCursor(20, 60);
+    gfx->print("STATE OF CHARGE");
+    gfx->setTextSize(5);
+    gfx->setTextColor(haveReading ? COLOR_WHITE : COLOR_MUTED, COLOR_PANEL_LIGHT);
+    gfx->setCursor(31, 82);
+    if (haveReading) {
+        gfx->printf("%u%%", latestReading.socPercent);
+    } else {
+        gfx->print("--%");
+    }
+
+    gfx->drawRoundRect(20, 135, 166, 18, 4, COLOR_MUTED);
+    if (haveReading) {
+        const int fill = std::max(0, std::min(162, static_cast<int>(latestReading.socPercent) * 162 / 100));
+        gfx->fillRoundRect(22, 137, fill, 14, 3, voltageColor(latestReading.voltage));
+    }
+    gfx->setTextSize(2);
+    gfx->setTextColor(haveReading && latestReading.voltage >= 13.3f ? COLOR_GREEN : COLOR_MUTED,
+                      COLOR_PANEL_LIGHT);
+    gfx->setCursor(20, 165);
+    gfx->print(haveReading && latestReading.voltage >= 13.3f ? "CHARGING" : "RESTING");
+    gfx->setTextSize(1);
+    gfx->setTextColor(COLOR_MUTED, COLOR_PANEL_LIGHT);
+    gfx->setCursor(20, 201);
+    gfx->printf("RSSI %d dBm   %u samples", haveReading ? latestReading.rssi : -127,
+                static_cast<unsigned>(history.size()));
+
+    gfx->setTextSize(1);
+    gfx->setTextColor(COLOR_MUTED, COLOR_PANEL_LIGHT);
+    gfx->setCursor(224, 59);
+    gfx->print("VOLTAGE");
+    gfx->setTextSize(4);
+    gfx->setTextColor(haveReading ? voltageColor(latestReading.voltage) : COLOR_MUTED,
+                      COLOR_PANEL_LIGHT);
+    gfx->setCursor(224, 76);
+    if (haveReading) {
+        gfx->printf("%.2fV", latestReading.voltage);
+    } else {
+        gfx->print("--.--V");
+    }
+    gfx->setTextSize(1);
+    gfx->setTextColor(COLOR_MUTED, COLOR_PANEL_LIGHT);
+    gfx->setCursor(386, 59);
+    gfx->print("TEMP");
+    gfx->setTextSize(2);
+    gfx->setTextColor(COLOR_CYAN, COLOR_PANEL_LIGHT);
+    gfx->setCursor(382, 84);
+    if (haveReading) {
+        gfx->printf("%dC", latestReading.temperatureC);
+    } else {
+        gfx->print("--C");
+    }
+
+    drawChart(210, 133, 262, 96, 6UL * 60UL / 5UL, true);
+    gfx->setTextSize(1);
+    gfx->setTextColor(COLOR_MUTED, COLOR_PANEL_LIGHT);
+    gfx->setCursor(220, 139);
+    gfx->print("6 HOUR VOLTAGE");
+}
+
+void drawHistoryPage()
+{
+    gfx->fillRect(0, 42, SCREEN_WIDTH, 196, COLOR_BACKGROUND);
+    const HistoryRange ranges[] = {HistoryRange::SixHours, HistoryRange::OneDay, HistoryRange::ThreeDays};
+    const char *labels[] = {"6H", "24H", "3D"};
+    for (uint8_t i = 0; i < 3; ++i) {
+        const int x = 14 + i * 70;
+        const bool active = historyRange == ranges[i];
+        gfx->fillRoundRect(x, 49, 62, 26, 5, active ? COLOR_GREEN : COLOR_PANEL_LIGHT);
+        gfx->setTextSize(1);
+        gfx->setTextColor(active ? COLOR_BLACK : COLOR_WHITE, active ? COLOR_GREEN : COLOR_PANEL_LIGHT);
+        gfx->setCursor(x + 23, 59);
+        gfx->print(labels[i]);
+    }
+    gfx->setTextColor(COLOR_MUTED, COLOR_BACKGROUND);
+    gfx->setCursor(250, 59);
+    gfx->printf("%s  %u/%u", historyRangeLabel(), static_cast<unsigned>(history.size()),
+                static_cast<unsigned>(HISTORY_CAPACITY));
+
+    const size_t samples = historySamplesForRange();
+    drawChart(14, 83, 452, 128, samples, true);
+    gfx->setTextSize(1);
+    gfx->setTextColor(COLOR_MUTED, COLOR_BACKGROUND);
+    gfx->setCursor(18, 219);
+    if (history.size() > 0) {
+        gfx->printf("MIN %.2fV", history.minVoltage(samples));
+        gfx->setCursor(180, 219);
+        gfx->printf("MAX %.2fV", history.maxVoltage(samples));
+        gfx->setCursor(350, 219);
+        gfx->printf("NOW %.2fV", latestReading.voltage);
+    } else {
+        gfx->print("NO HISTORY SAMPLES");
+    }
+}
+
+void drawTestsPage()
+{
+    gfx->fillRect(0, 42, SCREEN_WIDTH, 196, COLOR_BACKGROUND);
+    const int cardY[] = {50, 112, 174};
+    const char *titles[] = {"CRANKING", "CHARGING SYSTEM", "DIODE RIPPLE"};
+    for (uint8_t i = 0; i < 3; ++i) {
+        gfx->fillRoundRect(12, cardY[i], 456, 54, 6, COLOR_PANEL_LIGHT);
+        gfx->fillRect(12, cardY[i], 4, 54, i == 1 ? COLOR_GREEN : COLOR_BLUE);
+        gfx->setTextSize(1);
+        gfx->setTextColor(COLOR_MUTED, COLOR_PANEL_LIGHT);
+        gfx->setCursor(26, cardY[i] + 10);
+        gfx->print(titles[i]);
+    }
+
+    gfx->setTextSize(2);
+    gfx->setTextColor(COLOR_MUTED, COLOR_PANEL_LIGHT);
+    gfx->setCursor(26, 77);
+    gfx->print("--.--V   ---ms");
+    gfx->setTextSize(1);
+    gfx->setCursor(374, 78);
+    gfx->print("NO DATA");
+
+    const char *chargingState = "NO DATA";
+    uint16_t chargingColor = COLOR_MUTED;
+    if (haveReading) {
+        if (latestReading.voltage > 14.8f) {
+            chargingState = "HIGH";
+            chargingColor = COLOR_RED;
+        } else if (latestReading.voltage >= 13.3f) {
+            chargingState = "CHARGING";
+            chargingColor = COLOR_GREEN;
+        } else {
+            chargingState = "ENGINE OFF";
+        }
+    }
+    gfx->setTextSize(3);
+    gfx->setTextColor(chargingColor, COLOR_PANEL_LIGHT);
+    gfx->setCursor(26, 136);
+    if (haveReading) {
+        gfx->printf("%.2fV", latestReading.voltage);
+    } else {
+        gfx->print("--.--V");
+    }
+    gfx->setTextSize(1);
+    gfx->setCursor(360, 140);
+    gfx->print(chargingState);
+
+    gfx->setTextSize(2);
+    gfx->setTextColor(COLOR_MUTED, COLOR_PANEL_LIGHT);
+    gfx->setCursor(26, 201);
+    gfx->print("---mV");
+    gfx->setTextSize(1);
+    gfx->setCursor(374, 202);
+    gfx->print("NO DATA");
+}
+
+void redrawDashboard()
 {
     currentScreen = Screen::Dash;
-    drawStaticLayout();
+    gfx->fillScreen(COLOR_BACKGROUND);
+    drawHeader();
     drawStatus();
-    drawLatestReading();
-    drawHistoryChart();
-    drawFooter();
+    switch (dashPage) {
+        case DashPage::Overview:
+            drawOverview();
+            break;
+        case DashPage::History:
+            drawHistoryPage();
+            break;
+        case DashPage::Tests:
+            drawTestsPage();
+            break;
+    }
+    drawNavigation();
 }
 
 void setStatus(const char *status)
@@ -500,11 +720,41 @@ void drawSettingsHeader()
     gfx->setCursor(56, 12);
     gfx->print("Settings");
 
+    gfx->setTextSize(1);
+    gfx->setTextColor(COLOR_MUTED, COLOR_BLACK);
+    gfx->setCursor(184, 17);
+    gfx->printf("SAVED %u/%u", static_cast<unsigned>(registry.count()),
+                static_cast<unsigned>(MAX_SAVED_BM6_DEVICES));
+
     gfx->drawRoundRect(362, 6, 104, 30, 6, COLOR_BLUE);
     gfx->setTextSize(1);
     gfx->setTextColor(COLOR_WHITE, COLOR_BLACK);
     gfx->setCursor(386, 17);
     gfx->print("SCAN");
+}
+
+void drawSavedDeviceBar()
+{
+    clearTextArea(12, 64, 456, 32);
+    if (registry.count() == 0) {
+        gfx->setTextSize(1);
+        gfx->setTextColor(COLOR_MUTED, COLOR_BLACK);
+        gfx->setCursor(18, 76);
+        gfx->print("NO SAVED BATTERIES");
+        return;
+    }
+
+    const int width = 448 / registry.count();
+    for (uint8_t i = 0; i < registry.count(); ++i) {
+        const SavedBm6Device *device = registry.device(i);
+        const int x = 16 + i * width;
+        const bool active = i == registry.activeIndex();
+        gfx->fillRoundRect(x, 66, width - 6, 26, 5, active ? COLOR_GREEN : COLOR_PANEL);
+        gfx->setTextSize(1);
+        gfx->setTextColor(active ? COLOR_BLACK : COLOR_WHITE, active ? COLOR_GREEN : COLOR_PANEL);
+        gfx->setCursor(x + 7, 76);
+        gfx->printf("%u %.10s", static_cast<unsigned>(i + 1), device->name);
+    }
 }
 
 void copySortedScanDevices(BleScanDevice *devices, uint8_t &deviceCount)
@@ -524,6 +774,11 @@ void copySortedScanDevices(BleScanDevice *devices, uint8_t &deviceCount)
     }
 
     std::sort(devices, devices + deviceCount, [](const BleScanDevice &a, const BleScanDevice &b) {
+        const bool aSaved = savedDeviceIndex(a.address) >= 0;
+        const bool bSaved = savedDeviceIndex(b.address) >= 0;
+        if (aSaved != bSaved) {
+            return aSaved;
+        }
         if (a.bm6Service != b.bm6Service) {
             return a.bm6Service;
         }
@@ -572,11 +827,11 @@ void drawScanResults()
     uint8_t deviceCount = 0;
     copySortedScanDevices(devices, deviceCount);
 
-    clearTextArea(12, 66, 456, 166);
+    clearTextArea(12, 98, 456, 134);
     gfx->setTextSize(1);
     if (deviceCount == 0) {
         gfx->setTextColor(COLOR_AMBER, COLOR_BLACK);
-        gfx->setCursor(18, 92);
+        gfx->setCursor(18, 112);
         gfx->print("No BLE devices found");
         drawPageControls(deviceCount);
         return;
@@ -586,10 +841,12 @@ void drawScanResults()
     const uint8_t end = std::min<uint8_t>(deviceCount, start + SETTINGS_ROWS_PER_PAGE);
     for (uint8_t i = start; i < end; ++i) {
         const uint8_t visibleRow = i - start;
-        const int y = 72 + visibleRow * 18;
+        const int y = 102 + visibleRow * 18;
         clearTextArea(18, y, 438, 12);
         const bool skipped = shouldSkipDeviceTest(devices[i]);
-        gfx->setTextColor(devices[i].bm6Service ? COLOR_GREEN : (skipped ? COLOR_AMBER : COLOR_WHITE), COLOR_BLACK);
+        const int8_t savedIndex = savedDeviceIndex(devices[i].address);
+        const bool active = savedIndex >= 0 && savedIndex == registry.activeIndex();
+        gfx->setTextColor(active || devices[i].bm6Service ? COLOR_GREEN : (skipped ? COLOR_AMBER : COLOR_WHITE), COLOR_BLACK);
         gfx->setCursor(18, y);
         gfx->printf("%u %s", static_cast<unsigned>(visibleRow + 1), devices[i].address);
         gfx->setTextColor(COLOR_MUTED, COLOR_BLACK);
@@ -598,7 +855,15 @@ void drawScanResults()
         gfx->setCursor(220, y);
         const char *name = devices[i].name[0] ? devices[i].name : "(no name)";
         gfx->printf("%.18s", name);
-        if (devices[i].bm6Service) {
+        if (active) {
+            gfx->setTextColor(COLOR_GREEN, COLOR_BLACK);
+            gfx->setCursor(384, y);
+            gfx->print("ACTIVE");
+        } else if (savedIndex >= 0) {
+            gfx->setTextColor(COLOR_CYAN, COLOR_BLACK);
+            gfx->setCursor(390, y);
+            gfx->print("SAVED");
+        } else if (devices[i].bm6Service) {
             gfx->setTextColor(COLOR_GREEN, COLOR_BLACK);
             gfx->setCursor(390, y);
             gfx->print("BM6");
@@ -617,11 +882,11 @@ void drawScanResults()
 
 bool scanDeviceAtPoint(const TouchPoint &point, BleScanDevice &device)
 {
-    if (point.y < 72 || point.y >= 72 + SETTINGS_ROWS_PER_PAGE * 18) {
+    if (point.y < 102 || point.y >= 102 + SETTINGS_ROWS_PER_PAGE * 18) {
         return false;
     }
 
-    const uint8_t visibleRow = static_cast<uint8_t>((point.y - 72) / 18);
+    const uint8_t visibleRow = static_cast<uint8_t>((point.y - 102) / 18);
     const uint8_t row = settingsPage * SETTINGS_ROWS_PER_PAGE + visibleRow;
     BleScanDevice devices[MAX_SCAN_DEVICES];
     uint8_t deviceCount = 0;
@@ -648,12 +913,50 @@ bool scanDeviceAtRow(uint8_t row, BleScanDevice &device)
     return true;
 }
 
-void saveSelectedBm6(const BleScanDevice &device)
+bool loadActiveSavedDevice()
 {
-    configPrefs.putString("addr", device.address);
-    configPrefs.putUChar("atype", device.addressType);
-    bm6.setPreferredAddress(device.address, device.addressType);
+    const SavedBm6Device *device = registry.active();
+    if (device == nullptr) {
+        bm6TargetSelected = false;
+        bm6.setPreferredAddress("", 1);
+        history.begin(0);
+        haveReading = false;
+        return false;
+    }
+
+    bm6.setPreferredAddress(device->address, device->addressType);
+    history.begin(device->historySlot);
+    haveReading = history.latest(latestReading);
+    if (haveReading && latestReading.rssi == 0) {
+        latestReading.rssi = device->lastRssi;
+    }
     bm6TargetSelected = true;
+    Serial.printf("Active BM6 %s %s type %u history %u\n", device->name, device->address,
+                  device->addressType, device->historySlot);
+    return true;
+}
+
+bool selectSavedDeviceRelative(int8_t direction)
+{
+    if (!registry.selectRelative(direction)) {
+        return false;
+    }
+    loadActiveSavedDevice();
+    consecutivePollFailures = 0;
+    nextPollAtMs = millis();
+    redrawDashboard();
+    return true;
+}
+
+bool saveSelectedBm6(const BleScanDevice &device)
+{
+    const int8_t index = registry.addOrSelect(
+        device.address, device.addressType, device.name, device.rssi
+    );
+    if (index < 0) {
+        return false;
+    }
+    return loadActiveSavedDevice();
 }
 
 void testSelectedDevice(const BleScanDevice &device)
@@ -697,7 +1000,10 @@ void testSelectedDevice(const BleScanDevice &device)
 
     BleScanDevice selected = device;
     selected.addressType = addressType;
-    saveSelectedBm6(selected);
+    if (!saveSelectedBm6(selected)) {
+        drawSettingsStatus("Could not save BM6 (4 device limit)");
+        return;
+    }
     latestReading = reading;
     haveReading = true;
     history.addIfDue(reading);
@@ -742,7 +1048,8 @@ void beginSettingsScan()
     }
     drawSettingsHeader();
     drawSettingsStatus("Scanning nearby BLE devices for 30s...");
-    clearTextArea(12, 66, 456, 198);
+    drawSavedDeviceBar();
+    clearTextArea(12, 98, 456, 134);
     Serial.println("Settings BLE scan starting");
 
     bm6.begin();
@@ -814,8 +1121,7 @@ void pollBm6Now()
     }
     if (!bm6TargetSelected && !hasCompileTimeBm6Address()) {
         setStatus("Select BM6 in settings");
-        nextPollAtMs = millis() + BM6_POLL_INTERVAL_MS;
-        drawFooter();
+        nextPollAtMs = millis() + BM6_RECONNECT_INTERVAL_MS;
         return;
     }
     setStatus("Scanning BM6");
@@ -824,17 +1130,19 @@ void pollBm6Now()
     setStatus(pollResultText(result));
 
     if (result == Bm6PollResult::Ok) {
+        consecutivePollFailures = 0;
         latestReading = reading;
         haveReading = true;
         history.addIfDue(reading);
-        drawLatestReading();
-        drawHistoryChart();
+        registry.updateRssi(registry.activeIndex(), reading.rssi);
+        redrawDashboard();
         Serial.printf("BM6 %.2fV %u%% %dC RSSI %d\n",
                       reading.voltage, reading.socPercent, reading.temperatureC, reading.rssi);
+        nextPollAtMs = millis() + BM6_POLL_INTERVAL_MS;
+    } else {
+        ++consecutivePollFailures;
+        nextPollAtMs = millis() + BM6_RECONNECT_INTERVAL_MS;
     }
-
-    nextPollAtMs = millis() + BM6_POLL_INTERVAL_MS;
-    drawFooter();
 }
 
 void handleTouchTap(const TouchPoint &point)
@@ -844,14 +1152,56 @@ void handleTouchTap(const TouchPoint &point)
         beginSettingsScan();
         return;
     }
+    if (currentScreen == Screen::Dash && point.y <= 42 && point.x <= 34) {
+        selectSavedDeviceRelative(-1);
+        return;
+    }
+    if (currentScreen == Screen::Dash && point.y <= 42 && point.x >= 194 && point.x <= 232) {
+        selectSavedDeviceRelative(1);
+        return;
+    }
+    if (currentScreen == Screen::Dash && point.y >= 238) {
+        dashPage = point.x < 160
+            ? DashPage::Overview
+            : (point.x < 320 ? DashPage::History : DashPage::Tests);
+        redrawDashboard();
+        return;
+    }
+    if (currentScreen == Screen::Dash && dashPage == DashPage::History &&
+        point.y >= 48 && point.y <= 78) {
+        if (point.x >= 14 && point.x < 76) {
+            historyRange = HistoryRange::SixHours;
+        } else if (point.x >= 84 && point.x < 146) {
+            historyRange = HistoryRange::OneDay;
+        } else if (point.x >= 154 && point.x < 216) {
+            historyRange = HistoryRange::ThreeDays;
+        }
+        drawHistoryPage();
+        return;
+    }
     if (currentScreen == Screen::Settings && point.x >= 8 && point.x <= 42 && point.y >= 6 && point.y <= 36) {
         stopSettingsScan();
         Serial.println("Settings closed");
-        redrawAll();
+        redrawDashboard();
         return;
     }
     if (currentScreen == Screen::Settings && point.x >= 362 && point.x <= 466 && point.y >= 6 && point.y <= 36) {
         beginSettingsScan();
+        return;
+    }
+    if (currentScreen == Screen::Settings && point.y >= 64 && point.y <= 96 && registry.count() > 0) {
+        const int width = 448 / registry.count();
+        if (point.x >= 16) {
+            const uint8_t index = static_cast<uint8_t>((point.x - 16) / width);
+            if (index < registry.count() && registry.select(index)) {
+                loadActiveSavedDevice();
+                consecutivePollFailures = 0;
+                nextPollAtMs = millis();
+                drawSavedDeviceBar();
+                drawScanResults();
+                drawSettingsStatus("Saved battery selected");
+            }
+        }
         return;
     }
     if (currentScreen == Screen::Settings && point.y >= 238 && point.y <= 262) {
@@ -898,7 +1248,11 @@ void handleSerial()
     } else if (command == 'd') {
         stopSettingsScan();
         Serial.println("Settings closed");
-        redrawAll();
+        redrawDashboard();
+    } else if (command == '[' && currentScreen == Screen::Dash) {
+        selectSavedDeviceRelative(-1);
+    } else if (command == ']' && currentScreen == Screen::Dash) {
+        selectSavedDeviceRelative(1);
     } else if (command == 'r' && currentScreen == Screen::Settings) {
         beginSettingsScan();
     } else if (command >= '1' && command <= '9' && currentScreen == Screen::Settings) {
@@ -939,32 +1293,21 @@ void setup()
     gfx->setRotation(2);
     touch.begin();
 
-    history.begin();
-    history.latest(latestReading);
-    haveReading = history.size() > 0;
-    redrawAll();
-
-    configPrefs.begin("bm6cfg", false);
-    if (configPrefs.isKey("addr")) {
-        const String savedAddress = configPrefs.getString("addr", "");
-        if (savedAddress.length() == 17) {
-            const uint8_t savedAddressType = configPrefs.getUChar("atype", 1);
-            bm6.setPreferredAddress(savedAddress.c_str(), savedAddressType);
-            bm6TargetSelected = true;
-            Serial.printf("Loaded saved BM6 %s type %u\n", savedAddress.c_str(), savedAddressType);
-        }
-    }
+    registry.begin();
+    loadActiveSavedDevice();
     if (hasCompileTimeBm6Address()) {
+        bm6.setPreferredAddress(BM6_MAC_ADDRESS, 1);
         bm6TargetSelected = true;
     }
+
+    redrawDashboard();
 
     bm6.begin();
     if (bm6TargetSelected) {
         pollBm6Now();
     } else {
         setStatus("Select BM6 in settings");
-        nextPollAtMs = millis() + BM6_POLL_INTERVAL_MS;
-        drawFooter();
+        nextPollAtMs = millis() + BM6_RECONNECT_INTERVAL_MS;
     }
 }
 
@@ -979,11 +1322,16 @@ void loop()
         pollBm6Now();
     }
     if (currentScreen == Screen::Dash && now - lastUiTickMs >= 1000) {
-        drawFooter();
+        drawStatus();
         lastUiTickMs = now;
     }
     if (currentScreen == Screen::Dash && now - lastChartDrawMs >= 60000) {
-        drawHistoryChart();
+        if (dashPage == DashPage::Overview) {
+            drawOverview();
+        } else if (dashPage == DashPage::History) {
+            drawHistoryPage();
+        }
+        drawNavigation();
         lastChartDrawMs = now;
     }
     delay(50);

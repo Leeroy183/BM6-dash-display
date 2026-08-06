@@ -7,18 +7,32 @@
 
 namespace {
 constexpr char HISTORY_PARTITION[] = "history";
-constexpr char HISTORY_NAMESPACE[] = "bm6hist";
 constexpr char METADATA_KEY[] = "meta";
 }
 
-void PersistentHistory::begin()
+void PersistentHistory::begin(uint8_t deviceSlot)
 {
+    if (ready_) {
+        preferences_.end();
+    }
+    ready_ = false;
+    lastStoredAtMs_ = 0;
+    deviceSlot_ = deviceSlot;
+    reset();
+
     esp_err_t initResult = nvs_flash_init_partition(HISTORY_PARTITION);
     if (initResult == ESP_ERR_NVS_NO_FREE_PAGES || initResult == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         nvs_flash_erase_partition(HISTORY_PARTITION);
         initResult = nvs_flash_init_partition(HISTORY_PARTITION);
     }
-    if (initResult != ESP_OK || !preferences_.begin(HISTORY_NAMESPACE, false, HISTORY_PARTITION)) {
+    char historyNamespace[16];
+    if (deviceSlot_ == 0) {
+        std::snprintf(historyNamespace, sizeof(historyNamespace), "bm6hist");
+    } else {
+        std::snprintf(historyNamespace, sizeof(historyNamespace), "bm6hist%u",
+                      static_cast<unsigned>(deviceSlot_));
+    }
+    if (initResult != ESP_OK || !preferences_.begin(historyNamespace, false, HISTORY_PARTITION)) {
         Serial.printf("BM6 history partition unavailable: %s\n", esp_err_to_name(initResult));
         reset();
         return;
@@ -72,51 +86,57 @@ size_t PersistentHistory::size() const
     return state_.count;
 }
 
-float PersistentHistory::minVoltage() const
+float PersistentHistory::minVoltage(size_t recentSamples) const
 {
-    if (state_.count == 0) {
+    const size_t sampleCount = recentSampleCount(recentSamples);
+    if (sampleCount == 0) {
         return 0.0f;
     }
 
-    uint16_t minimum = state_.samples[physicalIndexFromOldest(0)].voltageCenti;
-    for (size_t i = 1; i < state_.count; ++i) {
+    const size_t first = state_.count - sampleCount;
+    uint16_t minimum = state_.samples[physicalIndexFromOldest(first)].voltageCenti;
+    for (size_t i = first + 1; i < state_.count; ++i) {
         minimum = std::min(minimum, state_.samples[physicalIndexFromOldest(i)].voltageCenti);
     }
     return minimum / 100.0f;
 }
 
-float PersistentHistory::maxVoltage() const
+float PersistentHistory::maxVoltage(size_t recentSamples) const
 {
-    if (state_.count == 0) {
+    const size_t sampleCount = recentSampleCount(recentSamples);
+    if (sampleCount == 0) {
         return 0.0f;
     }
 
-    uint16_t maximum = state_.samples[physicalIndexFromOldest(0)].voltageCenti;
-    for (size_t i = 1; i < state_.count; ++i) {
+    const size_t first = state_.count - sampleCount;
+    uint16_t maximum = state_.samples[physicalIndexFromOldest(first)].voltageCenti;
+    for (size_t i = first + 1; i < state_.count; ++i) {
         maximum = std::max(maximum, state_.samples[physicalIndexFromOldest(i)].voltageCenti);
     }
     return maximum / 100.0f;
 }
 
-int PersistentHistory::voltageHundredthsForChart(uint16_t pointIndex, uint16_t pointCount) const
+int PersistentHistory::voltageHundredthsForChart(
+    uint16_t pointIndex, uint16_t pointCount, size_t recentSamples
+) const
 {
-    if (state_.count == 0 || pointCount == 0) {
+    const size_t sampleCount = recentSampleCount(recentSamples);
+    if (sampleCount == 0 || pointCount == 0) {
         return -1;
     }
 
     size_t logicalIndex = 0;
-    if (state_.count <= pointCount) {
-        const uint16_t emptyPrefix = pointCount - state_.count;
+    if (sampleCount <= pointCount) {
+        const uint16_t emptyPrefix = pointCount - sampleCount;
         if (pointIndex < emptyPrefix) {
             return -1;
         }
-        logicalIndex = pointIndex - emptyPrefix;
+        logicalIndex = state_.count - sampleCount + pointIndex - emptyPrefix;
     } else if (pointCount == 1) {
         logicalIndex = state_.count - 1;
     } else {
-        logicalIndex = static_cast<size_t>(
-            std::lround((static_cast<double>(pointIndex) * (state_.count - 1)) / (pointCount - 1))
-        );
+        logicalIndex = state_.count - sampleCount + static_cast<size_t>(
+            std::lround((static_cast<double>(pointIndex) * (sampleCount - 1)) / (pointCount - 1)));
     }
 
     return state_.samples[physicalIndexFromOldest(logicalIndex)].voltageCenti;
@@ -185,6 +205,11 @@ size_t PersistentHistory::samplesInChunk(size_t chunkIndex) const
 {
     const size_t first = chunkIndex * SAMPLES_PER_CHUNK;
     return std::min(SAMPLES_PER_CHUNK, HISTORY_CAPACITY - first);
+}
+
+size_t PersistentHistory::recentSampleCount(size_t requested) const
+{
+    return std::min(static_cast<size_t>(state_.count), requested);
 }
 
 size_t PersistentHistory::physicalIndexFromOldest(size_t logicalIndex) const

@@ -11,6 +11,8 @@ the BM6 phone app.
 - decrypts the BM6 response on the ESP32
 - shows voltage, state of charge, temperature, and connection status
 - keeps a persistent 3-day rolling history and plots it on the display
+- saves up to four BM6 monitors, with a separate history for each battery
+- provides overview, 6-hour/24-hour/3-day history, and test-summary pages
 
 History is stored as small, wear-conscious chunks in a dedicated 128 KB ESP32
 NVS partition. The current single-battery configuration stores 864 five-minute
@@ -103,6 +105,13 @@ can prevent the dash from connecting.
 The QSPI dash firmware also has an on-screen settings scan. Tap the cog in the
 top-right corner to scan nearby BLE devices. Tap `SCAN` to rescan or the
 top-left back button to cancel any active scan and return to the dash.
+
+Successfully tested BM6 monitors are retained across power cycles. Saved
+batteries appear above the live scan results even when they are not currently
+advertising. Tap a saved battery there, or use the arrows beside the battery
+name on the dashboard, to switch its live reading and dedicated history. A
+missed startup advertisement is retried every 10 seconds until the saved BM6
+returns.
 
 Many BLE devices do not advertise a friendly name. The settings scan runs for 30
 seconds and can store 32 devices across pages. To identify a BM6, scan once with

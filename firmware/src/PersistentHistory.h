@@ -7,13 +7,14 @@
 
 class PersistentHistory {
   public:
-    void begin();
+    void begin(uint8_t deviceSlot = 0);
     bool addIfDue(const BatteryReading &reading);
     bool latest(BatteryReading &reading) const;
     size_t size() const;
-    float minVoltage() const;
-    float maxVoltage() const;
-    int voltageHundredthsForChart(uint16_t pointIndex, uint16_t pointCount) const;
+    float minVoltage(size_t recentSamples = HISTORY_CAPACITY) const;
+    float maxVoltage(size_t recentSamples = HISTORY_CAPACITY) const;
+    int voltageHundredthsForChart(uint16_t pointIndex, uint16_t pointCount,
+                                  size_t recentSamples = HISTORY_CAPACITY) const;
 
   private:
     struct HistorySample {
@@ -50,12 +51,14 @@ class PersistentHistory {
     PersistedState state_ = {};
     uint32_t lastStoredAtMs_ = 0;
     bool ready_ = false;
+    uint8_t deviceSlot_ = 0;
 
     void reset();
     bool load();
     bool saveMetadata();
     bool saveChunk(size_t sampleIndex);
     size_t samplesInChunk(size_t chunkIndex) const;
+    size_t recentSampleCount(size_t requested) const;
     size_t physicalIndexFromOldest(size_t logicalIndex) const;
     BatteryReading toReading(const HistorySample &sample) const;
 };
