@@ -14,9 +14,16 @@
 - [x] add PlatformIO environments for the integrated AliExpress ESP32-S3 display
 - [x] confirm LCD controller, backlight, flash, and PSRAM config
 - [x] add standalone QSPI dash screen for 480 x 272
-- [ ] confirm touch controller and input pins
+- [x] confirm GT911 touch controller on I2C address 0x5d
 - [ ] decide whether to keep the lightweight Arduino_GFX UI or move this target
       to LVGL for richer touch navigation
+
+## Settings
+
+- [x] add a settings cog target on the QSPI dash
+- [x] scan and list nearby BLE devices on the display
+- [ ] persist a selected BM6 address from the settings screen
+- [ ] add touch calibration if the tap coordinates are rotated or offset
 
 ## Multi-battery support
 

@@ -46,6 +46,16 @@ Edit `src/config.h` before flashing:
 Keep the BM6 phone app closed while testing. The monitor normally expects a
 single BLE central connection at a time.
 
+## Bench test a spare BM6
+
+Do not connect a BM6 directly across a 24 V supply. Published BM6 specifications
+list a 6-20 V input range for 12 V batteries, so a 24 V supply can damage it.
+
+For a bench test, set a current-limited supply to a normal 12 V battery voltage,
+for example 12.6 V. Connect the BM6 red lead to supply positive and black lead
+to supply negative. A low current limit such as 50-100 mA is enough for initial
+testing because the BM6 normally draws only a few milliamps.
+
 ## Build and flash
 
 For the connected QSPI/NV3041A display, from this folder:
@@ -87,3 +97,12 @@ pio device monitor -e ble_scan_debug
 Use the BM6 MAC address from the scan output or the phone app in
 `src/config.h`. The BM6 usually accepts only one active BLE central, so the app
 can prevent the dash from connecting.
+
+The QSPI dash firmware also has an on-screen settings scan. Tap the cog in the
+top-right corner to scan nearby BLE devices. Tap `SCAN` to rescan or the
+top-left back button to return to the dash. If touch calibration needs work, use
+serial commands while monitoring at 115200 baud:
+
+- `s` opens settings and scans
+- `r` rescans while on the settings screen
+- `d` returns to the dash

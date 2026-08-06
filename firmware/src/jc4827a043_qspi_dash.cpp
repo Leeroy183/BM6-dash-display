@@ -1,13 +1,20 @@
 #include <Arduino.h>
 #include <Arduino_GFX_Library.h>
+#include <NimBLEDevice.h>
+#include <Wire.h>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include "Bm6Client.h"
 #include "PersistentHistory.h"
 #include "config.h"
 
 namespace {
 constexpr int GFX_BL = 1;
+constexpr int TOUCH_SDA = 8;
+constexpr int TOUCH_SCL = 4;
+constexpr int TOUCH_RST = 38;
+constexpr int TOUCH_INT = 3;
 constexpr int SCREEN_WIDTH = 480;
 constexpr int SCREEN_HEIGHT = 272;
 constexpr uint16_t COLOR_BLACK = 0x0000;
@@ -18,20 +25,170 @@ constexpr uint16_t COLOR_GREEN = 0x07e0;
 constexpr uint16_t COLOR_AMBER = 0xfd20;
 constexpr uint16_t COLOR_RED = 0xf800;
 constexpr uint16_t COLOR_BLUE = 0x2d7f;
+constexpr uint16_t COLOR_CYAN = 0x07ff;
+constexpr uint8_t GT911_ADDR_1 = 0x5d;
+constexpr uint8_t GT911_ADDR_2 = 0x14;
+constexpr uint16_t GT911_POINT_STATUS = 0x814e;
+constexpr uint8_t MAX_SCAN_DEVICES = 10;
 
 Arduino_DataBus *bus = new Arduino_ESP32QSPI(
     45 /* CS */, 47 /* SCK */, 21 /* D0 */, 48 /* D1 */, 40 /* D2 */, 39 /* D3 */
 );
 Arduino_GFX *gfx = new Arduino_NV3041A(bus, GFX_NOT_DEFINED /* RST */, 0 /* rotation */, true /* IPS */);
 
+struct TouchPoint {
+    int16_t x = 0;
+    int16_t y = 0;
+};
+
+class Gt911Touch {
+  public:
+    void begin()
+    {
+        pinMode(TOUCH_INT, INPUT);
+        pinMode(TOUCH_RST, OUTPUT);
+        digitalWrite(TOUCH_RST, LOW);
+        delay(20);
+        digitalWrite(TOUCH_RST, HIGH);
+        delay(80);
+        Wire.begin(TOUCH_SDA, TOUCH_SCL);
+        Wire.setClock(400000);
+        if (probe(GT911_ADDR_1)) {
+            address_ = GT911_ADDR_1;
+        } else if (probe(GT911_ADDR_2)) {
+            address_ = GT911_ADDR_2;
+        }
+        if (address_ != 0) {
+            Serial.printf("GT911 touch found at 0x%02x\n", address_);
+        } else {
+            Serial.println("GT911 touch not found");
+        }
+    }
+
+    bool read(TouchPoint &point)
+    {
+        if (address_ == 0) {
+            return false;
+        }
+
+        uint8_t status = 0;
+        if (!readBytes(GT911_POINT_STATUS, &status, 1) || (status & 0x80) == 0) {
+            return false;
+        }
+
+        const uint8_t points = status & 0x0f;
+        if (points == 0) {
+            clearStatus();
+            return false;
+        }
+
+        uint8_t data[4] = {};
+        if (!readBytes(0x814f, data, sizeof(data))) {
+            clearStatus();
+            return false;
+        }
+        clearStatus();
+
+        const int16_t rawX = static_cast<int16_t>(data[0] | (data[1] << 8));
+        const int16_t rawY = static_cast<int16_t>(data[2] | (data[3] << 8));
+        point.x = constrain(SCREEN_WIDTH - 1 - rawX, 0, SCREEN_WIDTH - 1);
+        point.y = constrain(SCREEN_HEIGHT - 1 - rawY, 0, SCREEN_HEIGHT - 1);
+        return true;
+    }
+
+  private:
+    uint8_t address_ = 0;
+
+    bool probe(uint8_t address)
+    {
+        Wire.beginTransmission(address);
+        return Wire.endTransmission() == 0;
+    }
+
+    bool writeRegister(uint16_t reg, uint8_t value)
+    {
+        Wire.beginTransmission(address_);
+        Wire.write(static_cast<uint8_t>(reg >> 8));
+        Wire.write(static_cast<uint8_t>(reg & 0xff));
+        Wire.write(value);
+        return Wire.endTransmission() == 0;
+    }
+
+    bool readBytes(uint16_t reg, uint8_t *buffer, size_t length)
+    {
+        Wire.beginTransmission(address_);
+        Wire.write(static_cast<uint8_t>(reg >> 8));
+        Wire.write(static_cast<uint8_t>(reg & 0xff));
+        if (Wire.endTransmission(false) != 0) {
+            return false;
+        }
+        return Wire.requestFrom(address_, static_cast<uint8_t>(length)) == length &&
+               Wire.readBytes(buffer, length) == length;
+    }
+
+    void clearStatus()
+    {
+        writeRegister(GT911_POINT_STATUS, 0);
+    }
+};
+
+struct BleScanDevice {
+    char address[18] = "";
+    char name[24] = "";
+    int rssi = -127;
+    bool bm6Service = false;
+};
+
+enum class Screen {
+    Dash,
+    Settings
+};
+
 Bm6Client bm6;
 PersistentHistory history;
+Gt911Touch touch;
 BatteryReading latestReading;
+BleScanDevice scanDevices[MAX_SCAN_DEVICES];
+uint8_t scanDeviceCount = 0;
 bool haveReading = false;
+bool touchWasDown = false;
 uint32_t nextPollAtMs = 0;
 uint32_t lastUiTickMs = 0;
 uint32_t lastChartDrawMs = 0;
 char currentStatus[36] = "Starting";
+Screen currentScreen = Screen::Dash;
+
+class SettingsScanCallbacks : public NimBLEScanCallbacks {
+  public:
+    void onResult(const NimBLEAdvertisedDevice *device) override
+    {
+        const char *address = device->getAddress().toString().c_str();
+        BleScanDevice *slot = nullptr;
+        for (uint8_t i = 0; i < scanDeviceCount; ++i) {
+            if (std::strcmp(scanDevices[i].address, address) == 0) {
+                slot = &scanDevices[i];
+                break;
+            }
+        }
+        if (slot == nullptr) {
+            if (scanDeviceCount >= MAX_SCAN_DEVICES) {
+                return;
+            }
+            slot = &scanDevices[scanDeviceCount++];
+            std::strncpy(slot->address, address, sizeof(slot->address) - 1);
+        }
+
+        slot->rssi = device->getRSSI();
+        slot->bm6Service = device->isAdvertisingService(NimBLEUUID("0000fff0-0000-1000-8000-00805f9b34fb"));
+        if (device->haveName()) {
+            std::strncpy(slot->name, device->getName().c_str(), sizeof(slot->name) - 1);
+        }
+        Serial.printf("BLE %s RSSI %d name=\"%s\"%s\n",
+                      slot->address, slot->rssi, slot->name, slot->bm6Service ? " BM6_SERVICE" : "");
+    }
+};
+
+SettingsScanCallbacks settingsScanCallbacks;
 
 uint16_t voltageColor(float voltage)
 {
@@ -74,6 +231,17 @@ void clearTextArea(int x, int y, int w, int h, uint16_t color = COLOR_BLACK)
     gfx->fillRect(x, y, w, h, color);
 }
 
+void drawCogButton()
+{
+    gfx->drawRoundRect(438, 4, 34, 34, 6, COLOR_MUTED);
+    gfx->drawCircle(455, 21, 8, COLOR_WHITE);
+    gfx->drawCircle(455, 21, 3, COLOR_WHITE);
+    gfx->drawLine(455, 9, 455, 13, COLOR_WHITE);
+    gfx->drawLine(455, 29, 455, 33, COLOR_WHITE);
+    gfx->drawLine(443, 21, 447, 21, COLOR_WHITE);
+    gfx->drawLine(463, 21, 467, 21, COLOR_WHITE);
+}
+
 void drawStaticLayout()
 {
     gfx->fillScreen(COLOR_BLACK);
@@ -81,6 +249,7 @@ void drawStaticLayout()
     gfx->setTextSize(2);
     gfx->setCursor(14, 12);
     gfx->print("BM6 Dash Display");
+    drawCogButton();
 
     gfx->drawRoundRect(12, 42, 456, 104, 8, COLOR_MUTED);
     gfx->drawRoundRect(12, 158, 456, 92, 8, COLOR_MUTED);
@@ -94,7 +263,7 @@ void drawStaticLayout()
 
 void drawStatus()
 {
-    clearTextArea(250, 10, 216, 18);
+    clearTextArea(250, 10, 184, 18);
     gfx->setTextSize(1);
     gfx->setTextColor(COLOR_MUTED, COLOR_BLACK);
     gfx->setCursor(250, 14);
@@ -193,6 +362,7 @@ void drawHistoryChart()
 
 void redrawAll()
 {
+    currentScreen = Screen::Dash;
     drawStaticLayout();
     drawStatus();
     drawLatestReading();
@@ -204,12 +374,97 @@ void setStatus(const char *status)
 {
     strncpy(currentStatus, status, sizeof(currentStatus) - 1);
     currentStatus[sizeof(currentStatus) - 1] = '\0';
-    drawStatus();
+    if (currentScreen == Screen::Dash) {
+        drawStatus();
+    }
     Serial.println(currentStatus);
+}
+
+void drawSettingsHeader(const char *status)
+{
+    gfx->fillScreen(COLOR_BLACK);
+    gfx->drawRoundRect(8, 6, 34, 30, 6, COLOR_MUTED);
+    gfx->setTextSize(2);
+    gfx->setTextColor(COLOR_WHITE, COLOR_BLACK);
+    gfx->setCursor(17, 12);
+    gfx->print("<");
+    gfx->setCursor(56, 12);
+    gfx->print("Settings");
+
+    gfx->drawRoundRect(362, 6, 104, 30, 6, COLOR_BLUE);
+    gfx->setTextSize(1);
+    gfx->setTextColor(COLOR_WHITE, COLOR_BLACK);
+    gfx->setCursor(386, 17);
+    gfx->print("SCAN");
+
+    gfx->setTextColor(COLOR_MUTED, COLOR_BLACK);
+    gfx->setCursor(18, 48);
+    gfx->print(status);
+}
+
+void drawScanResults()
+{
+    std::sort(scanDevices, scanDevices + scanDeviceCount, [](const BleScanDevice &a, const BleScanDevice &b) {
+        return a.rssi > b.rssi;
+    });
+
+    clearTextArea(12, 66, 456, 198);
+    gfx->setTextSize(1);
+    if (scanDeviceCount == 0) {
+        gfx->setTextColor(COLOR_AMBER, COLOR_BLACK);
+        gfx->setCursor(18, 92);
+        gfx->print("No BLE devices found");
+        return;
+    }
+
+    for (uint8_t i = 0; i < scanDeviceCount; ++i) {
+        const int y = 72 + i * 18;
+        gfx->setTextColor(scanDevices[i].bm6Service ? COLOR_GREEN : COLOR_WHITE, COLOR_BLACK);
+        gfx->setCursor(18, y);
+        gfx->printf("%s", scanDevices[i].address);
+        gfx->setTextColor(COLOR_MUTED, COLOR_BLACK);
+        gfx->setCursor(158, y);
+        gfx->printf("%4d", scanDevices[i].rssi);
+        gfx->setCursor(204, y);
+        const char *name = scanDevices[i].name[0] ? scanDevices[i].name : "(no name)";
+        gfx->printf("%.22s", name);
+        if (scanDevices[i].bm6Service) {
+            gfx->setTextColor(COLOR_GREEN, COLOR_BLACK);
+            gfx->setCursor(390, y);
+            gfx->print("BM6");
+        }
+    }
+}
+
+void scanBleForSettings()
+{
+    currentScreen = Screen::Settings;
+    scanDeviceCount = 0;
+    drawSettingsHeader("Scanning nearby BLE devices...");
+    Serial.println("Settings BLE scan starting");
+
+    bm6.begin();
+    NimBLEScan *scan = NimBLEDevice::getScan();
+    scan->setScanCallbacks(&settingsScanCallbacks, false);
+    scan->setActiveScan(true);
+    scan->setInterval(100);
+    scan->setWindow(100);
+    scan->start(BLE_SETTINGS_SCAN_MS, false, true);
+    while (scan->isScanning()) {
+        delay(50);
+    }
+    scan->setScanCallbacks(nullptr, false);
+
+    drawSettingsHeader("Tap SCAN or send 'r' on serial to rescan");
+    drawScanResults();
+    Serial.printf("Settings BLE scan complete, %u devices\n", scanDeviceCount);
 }
 
 void pollBm6Now()
 {
+    if (currentScreen != Screen::Dash) {
+        return;
+    }
     setStatus("Scanning BM6");
     BatteryReading reading;
     const Bm6PollResult result = bm6.poll(reading);
@@ -228,6 +483,49 @@ void pollBm6Now()
     nextPollAtMs = millis() + BM6_POLL_INTERVAL_MS;
     drawFooter();
 }
+
+void handleTouchTap(const TouchPoint &point)
+{
+    Serial.printf("Touch %d,%d\n", point.x, point.y);
+    if (currentScreen == Screen::Dash && point.x >= 438 && point.y <= 40) {
+        scanBleForSettings();
+        return;
+    }
+    if (currentScreen == Screen::Settings && point.x <= 48 && point.y <= 44) {
+        redrawAll();
+        return;
+    }
+    if (currentScreen == Screen::Settings && point.x >= 352 && point.y <= 44) {
+        scanBleForSettings();
+    }
+}
+
+void handleTouch()
+{
+    TouchPoint point;
+    const bool touched = touch.read(point);
+    if (touched && !touchWasDown) {
+        touchWasDown = true;
+        handleTouchTap(point);
+    } else if (!touched) {
+        touchWasDown = false;
+    }
+}
+
+void handleSerial()
+{
+    if (!Serial.available()) {
+        return;
+    }
+    const char command = static_cast<char>(Serial.read());
+    if (command == 's') {
+        scanBleForSettings();
+    } else if (command == 'd') {
+        redrawAll();
+    } else if (command == 'r' && currentScreen == Screen::Settings) {
+        scanBleForSettings();
+    }
+}
 } // namespace
 
 void setup()
@@ -245,6 +543,7 @@ void setup()
     }
     gfx->invertDisplay(true);
     gfx->setRotation(2);
+    touch.begin();
 
     history.begin();
     history.latest(latestReading);
@@ -258,14 +557,17 @@ void setup()
 void loop()
 {
     const uint32_t now = millis();
-    if (static_cast<int32_t>(now - nextPollAtMs) >= 0) {
+    handleSerial();
+    handleTouch();
+
+    if (currentScreen == Screen::Dash && static_cast<int32_t>(now - nextPollAtMs) >= 0) {
         pollBm6Now();
     }
-    if (now - lastUiTickMs >= 1000) {
+    if (currentScreen == Screen::Dash && now - lastUiTickMs >= 1000) {
         drawFooter();
         lastUiTickMs = now;
     }
-    if (now - lastChartDrawMs >= 60000) {
+    if (currentScreen == Screen::Dash && now - lastChartDrawMs >= 60000) {
         drawHistoryChart();
         lastChartDrawMs = now;
     }
