@@ -4,7 +4,6 @@
 #include <Wire.h>
 #include <algorithm>
 #include <cctype>
-#include <cmath>
 #include <cstring>
 #include <strings.h>
 #include <string>
@@ -22,10 +21,10 @@ constexpr int TOUCH_INT = 3;
 constexpr int SCREEN_WIDTH = 480;
 constexpr int SCREEN_HEIGHT = 272;
 constexpr uint16_t COLOR_BLACK = 0x0000;
-constexpr uint16_t COLOR_BACKGROUND = 0x0861;
+constexpr uint16_t COLOR_BACKGROUND = COLOR_BLACK;
 constexpr uint16_t COLOR_WHITE = 0xffff;
-constexpr uint16_t COLOR_PANEL = 0x18e3;
-constexpr uint16_t COLOR_PANEL_LIGHT = 0x2945;
+constexpr uint16_t COLOR_PANEL = COLOR_BLACK;
+constexpr uint16_t COLOR_PANEL_LIGHT = COLOR_BLACK;
 constexpr uint16_t COLOR_MUTED = 0x9cf3;
 constexpr uint16_t COLOR_GREEN = 0x07e0;
 constexpr uint16_t COLOR_AMBER = 0xfd20;
@@ -450,7 +449,7 @@ void drawNavigation()
     for (uint8_t i = 0; i < 3; ++i) {
         const bool active = static_cast<uint8_t>(dashPage) == i;
         if (active) {
-            gfx->fillRoundRect(i * tabWidth + 4, y + 3, tabWidth - 8, 28, 6, COLOR_PANEL_LIGHT);
+            gfx->drawRoundRect(i * tabWidth + 4, y + 3, tabWidth - 8, 28, 6, COLOR_GREEN);
         }
     }
 
@@ -492,8 +491,8 @@ void drawChart(int x0, int y0, int w, int h, size_t recentSamples, bool grid)
         return;
     }
 
-    const int minCenti = std::max(900, static_cast<int>(std::floor((history.minVoltage(recentSamples) - 0.15f) * 100.0f)));
-    const int maxCenti = std::max(minCenti + 60, std::min(1600, static_cast<int>(std::ceil((history.maxVoltage(recentSamples) + 0.15f) * 100.0f))));
+    constexpr int minCenti = 800;
+    constexpr int maxCenti = 1600;
     int lastX = -1;
     int lastY = -1;
     for (int x = 0; x < w - 2; ++x) {
@@ -516,6 +515,8 @@ void drawOverview()
     gfx->fillRect(0, 42, SCREEN_WIDTH, 196, COLOR_BACKGROUND);
     gfx->fillRoundRect(8, 49, 194, 180, 6, COLOR_PANEL_LIGHT);
     gfx->fillRoundRect(210, 49, 262, 76, 6, COLOR_PANEL_LIGHT);
+    gfx->drawRoundRect(8, 49, 194, 180, 6, COLOR_MUTED);
+    gfx->drawRoundRect(210, 49, 262, 76, 6, COLOR_MUTED);
 
     gfx->setTextSize(1);
     gfx->setTextColor(COLOR_MUTED, COLOR_PANEL_LIGHT);
@@ -599,7 +600,15 @@ void drawHistoryPage()
                 static_cast<unsigned>(HISTORY_CAPACITY));
 
     const size_t samples = historySamplesForRange();
-    drawChart(14, 83, 452, 128, samples, true);
+    gfx->setTextSize(1);
+    gfx->setTextColor(COLOR_MUTED, COLOR_BACKGROUND);
+    gfx->setCursor(14, 84);
+    gfx->print("16V");
+    gfx->setCursor(14, 144);
+    gfx->print("12V");
+    gfx->setCursor(14, 202);
+    gfx->print("8V");
+    drawChart(42, 83, 424, 128, samples, true);
     gfx->setTextSize(1);
     gfx->setTextColor(COLOR_MUTED, COLOR_BACKGROUND);
     gfx->setCursor(18, 219);
@@ -621,6 +630,7 @@ void drawTestsPage()
     const char *titles[] = {"CRANKING", "CHARGING SYSTEM", "DIODE RIPPLE"};
     for (uint8_t i = 0; i < 3; ++i) {
         gfx->fillRoundRect(12, cardY[i], 456, 54, 6, COLOR_PANEL_LIGHT);
+        gfx->drawRoundRect(12, cardY[i], 456, 54, 6, COLOR_MUTED);
         gfx->fillRect(12, cardY[i], 4, 54, i == 1 ? COLOR_GREEN : COLOR_BLUE);
         gfx->setTextSize(1);
         gfx->setTextColor(COLOR_MUTED, COLOR_PANEL_LIGHT);
@@ -670,12 +680,8 @@ void drawTestsPage()
     gfx->print("NO DATA");
 }
 
-void redrawDashboard()
+void drawDashboardPage()
 {
-    currentScreen = Screen::Dash;
-    gfx->fillScreen(COLOR_BACKGROUND);
-    drawHeader();
-    drawStatus();
     switch (dashPage) {
         case DashPage::Overview:
             drawOverview();
@@ -688,6 +694,15 @@ void redrawDashboard()
             break;
     }
     drawNavigation();
+}
+
+void redrawDashboard()
+{
+    currentScreen = Screen::Dash;
+    gfx->fillScreen(COLOR_BACKGROUND);
+    drawHeader();
+    drawStatus();
+    drawDashboardPage();
 }
 
 void setStatus(const char *status)
@@ -1135,7 +1150,8 @@ void pollBm6Now()
         haveReading = true;
         history.addIfDue(reading);
         registry.updateRssi(registry.activeIndex(), reading.rssi);
-        redrawDashboard();
+        drawStatus();
+        drawDashboardPage();
         Serial.printf("BM6 %.2fV %u%% %dC RSSI %d\n",
                       reading.voltage, reading.socPercent, reading.temperatureC, reading.rssi);
         nextPollAtMs = millis() + BM6_POLL_INTERVAL_MS;
@@ -1164,7 +1180,7 @@ void handleTouchTap(const TouchPoint &point)
         dashPage = point.x < 160
             ? DashPage::Overview
             : (point.x < 320 ? DashPage::History : DashPage::Tests);
-        redrawDashboard();
+        drawDashboardPage();
         return;
     }
     if (currentScreen == Screen::Dash && dashPage == DashPage::History &&
