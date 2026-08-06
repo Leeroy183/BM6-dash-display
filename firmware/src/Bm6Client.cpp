@@ -90,7 +90,7 @@ Bm6PollResult Bm6Client::poll(BatteryReading &reading)
     return pollResolvedAddress(address, rssi, reading);
 }
 
-Bm6PollResult Bm6Client::pollAddress(const char *address, uint8_t addressType, BatteryReading &reading)
+Bm6PollResult Bm6Client::pollAddress(const char *address, uint8_t addressType, int rssi, BatteryReading &reading)
 {
     if (!hasAddress(address)) {
         return Bm6PollResult::NotFound;
@@ -98,7 +98,7 @@ Bm6PollResult Bm6Client::pollAddress(const char *address, uint8_t addressType, B
 
     begin();
     NimBLEAddress target(std::string(address), addressType);
-    return pollResolvedAddress(target, 0, reading);
+    return pollResolvedAddress(target, rssi, reading);
 }
 
 void Bm6Client::setPreferredAddress(const char *address, uint8_t addressType)

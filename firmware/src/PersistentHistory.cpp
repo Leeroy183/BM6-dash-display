@@ -2,15 +2,33 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <nvs_flash.h>
+
+namespace {
+constexpr char HISTORY_PARTITION[] = "history";
+constexpr char HISTORY_NAMESPACE[] = "bm6hist";
+constexpr char METADATA_KEY[] = "meta";
+}
 
 void PersistentHistory::begin()
 {
-    preferences_.begin("bm6hist", false);
-    const size_t loaded = preferences_.getBytes("state", &state_, sizeof(state_));
-    if (loaded != sizeof(state_) || state_.magic != MAGIC || state_.version != VERSION ||
-        state_.next >= HISTORY_CAPACITY || state_.count > HISTORY_CAPACITY) {
+    esp_err_t initResult = nvs_flash_init_partition(HISTORY_PARTITION);
+    if (initResult == ESP_ERR_NVS_NO_FREE_PAGES || initResult == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase_partition(HISTORY_PARTITION);
+        initResult = nvs_flash_init_partition(HISTORY_PARTITION);
+    }
+    if (initResult != ESP_OK || !preferences_.begin(HISTORY_NAMESPACE, false, HISTORY_PARTITION)) {
+        Serial.printf("BM6 history partition unavailable: %s\n", esp_err_to_name(initResult));
         reset();
-        save();
+        return;
+    }
+
+    ready_ = true;
+    if (!load()) {
+        preferences_.clear();
+        reset();
+        saveMetadata();
     }
 }
 
@@ -26,13 +44,16 @@ bool PersistentHistory::addIfDue(const BatteryReading &reading)
     sample.temperatureC = static_cast<int8_t>(std::max(-128, std::min(127, reading.temperatureC)));
     sample.socPercent = reading.socPercent;
 
-    state_.samples[state_.next] = sample;
+    const size_t sampleIndex = state_.next;
+    state_.samples[sampleIndex] = sample;
     state_.next = (state_.next + 1) % HISTORY_CAPACITY;
     if (state_.count < HISTORY_CAPACITY) {
         ++state_.count;
     }
     lastStoredAtMs_ = millis();
-    save();
+    if (ready_ && (!saveChunk(sampleIndex) || !saveMetadata())) {
+        Serial.println("BM6 history save failed");
+    }
     return true;
 }
 
@@ -108,9 +129,62 @@ void PersistentHistory::reset()
     state_.version = VERSION;
 }
 
-void PersistentHistory::save()
+bool PersistentHistory::load()
 {
-    preferences_.putBytes("state", &state_, sizeof(state_));
+    PersistedMetadata metadata = {};
+    if (preferences_.getBytes(METADATA_KEY, &metadata, sizeof(metadata)) != sizeof(metadata) ||
+        metadata.magic != MAGIC || metadata.version != VERSION ||
+        metadata.next >= HISTORY_CAPACITY || metadata.count > HISTORY_CAPACITY ||
+        (metadata.count < HISTORY_CAPACITY && metadata.next != metadata.count)) {
+        return false;
+    }
+
+    reset();
+    state_.next = metadata.next;
+    state_.count = metadata.count;
+    const size_t chunksToLoad = state_.count == 0
+        ? 0
+        : (state_.count + SAMPLES_PER_CHUNK - 1) / SAMPLES_PER_CHUNK;
+    for (size_t chunk = 0; chunk < chunksToLoad; ++chunk) {
+        char key[8];
+        std::snprintf(key, sizeof(key), "c%02u", static_cast<unsigned>(chunk));
+        const size_t sampleCount = samplesInChunk(chunk);
+        if (preferences_.getBytes(key, &state_.samples[chunk * SAMPLES_PER_CHUNK],
+                                  sampleCount * sizeof(HistorySample)) !=
+            sampleCount * sizeof(HistorySample)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool PersistentHistory::saveMetadata()
+{
+    PersistedMetadata metadata = {
+        state_.magic,
+        state_.version,
+        state_.reserved,
+        state_.next,
+        state_.count
+    };
+    return preferences_.putBytes(METADATA_KEY, &metadata, sizeof(metadata)) == sizeof(metadata);
+}
+
+bool PersistentHistory::saveChunk(size_t sampleIndex)
+{
+    const size_t chunk = sampleIndex / SAMPLES_PER_CHUNK;
+    char key[8];
+    std::snprintf(key, sizeof(key), "c%02u", static_cast<unsigned>(chunk));
+    const size_t sampleCount = samplesInChunk(chunk);
+    return preferences_.putBytes(key, &state_.samples[chunk * SAMPLES_PER_CHUNK],
+                                 sampleCount * sizeof(HistorySample)) ==
+           sampleCount * sizeof(HistorySample);
+}
+
+size_t PersistentHistory::samplesInChunk(size_t chunkIndex) const
+{
+    const size_t first = chunkIndex * SAMPLES_PER_CHUNK;
+    return std::min(SAMPLES_PER_CHUNK, HISTORY_CAPACITY - first);
 }
 
 size_t PersistentHistory::physicalIndexFromOldest(size_t logicalIndex) const

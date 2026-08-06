@@ -12,9 +12,11 @@ the BM6 phone app.
 - shows voltage, state of charge, temperature, and connection status
 - keeps a persistent 3-day rolling history and plots it on the display
 
-History is stored in ESP32 NVS as 5-minute samples. The current single-battery
-configuration stores 864 samples, covering 3 days of voltage, state of charge,
-and temperature while the dash firmware is polling the BM6.
+History is stored as small, wear-conscious chunks in a dedicated 128 KB ESP32
+NVS partition. The current single-battery configuration stores 864 five-minute
+samples, covering 3 days of voltage, state of charge, and temperature while the
+dash firmware is polling the BM6. The selected BM6 address remains in the
+standard NVS partition, so firmware updates do not require selecting it again.
 
 ## Hardware targets
 

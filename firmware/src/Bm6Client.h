@@ -20,7 +20,7 @@ class Bm6Client {
   public:
     void begin();
     Bm6PollResult poll(BatteryReading &reading);
-    Bm6PollResult pollAddress(const char *address, uint8_t addressType, BatteryReading &reading);
+    Bm6PollResult pollAddress(const char *address, uint8_t addressType, int rssi, BatteryReading &reading);
     void setPreferredAddress(const char *address, uint8_t addressType);
     const char *preferredAddress() const;
     uint8_t preferredAddressType() const;
