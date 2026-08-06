@@ -20,6 +20,7 @@ constexpr int TOUCH_RST = 38;
 constexpr int TOUCH_INT = 3;
 constexpr int SCREEN_WIDTH = 480;
 constexpr int SCREEN_HEIGHT = 272;
+constexpr uint8_t DISPLAY_ROTATION = 0;
 constexpr uint16_t COLOR_BLACK = 0x0000;
 constexpr uint16_t COLOR_BACKGROUND = COLOR_BLACK;
 constexpr uint16_t COLOR_WHITE = 0xffff;
@@ -105,8 +106,8 @@ class Gt911Touch {
 
         const int16_t rawX = static_cast<int16_t>(data[1] | (data[2] << 8));
         const int16_t rawY = static_cast<int16_t>(data[3] | (data[4] << 8));
-        point.x = constrain(rawX, 0, SCREEN_WIDTH - 1);
-        point.y = constrain(rawY, 0, SCREEN_HEIGHT - 1);
+        point.x = SCREEN_WIDTH - 1 - constrain(rawX, 0, SCREEN_WIDTH - 1);
+        point.y = SCREEN_HEIGHT - 1 - constrain(rawY, 0, SCREEN_HEIGHT - 1);
         contact = true;
         return true;
     }
@@ -1428,7 +1429,7 @@ void setup()
         return;
     }
     gfx->invertDisplay(false);
-    gfx->setRotation(2);
+    gfx->setRotation(DISPLAY_ROTATION);
     touch.begin();
 
     registry.begin();
