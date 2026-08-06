@@ -8,7 +8,9 @@ static constexpr char BM6_MAC_ADDRESS[] = "00:00:00:00:00:00";
 static constexpr char BM6_ADVERTISED_NAME[] = "BM6";
 
 static constexpr uint32_t BM6_SCAN_TIMEOUT_MS = 10000;
-static constexpr uint32_t BM6_PACKET_TIMEOUT_MS = 5000;
+static constexpr uint32_t BM6_CONNECT_TIMEOUT_MS = 10000;
+static constexpr uint32_t BM6_PACKET_TIMEOUT_MS = 7000;
+static constexpr uint8_t BM6_CONNECT_ATTEMPTS = 3;
 static constexpr uint32_t BM6_POLL_INTERVAL_MS = 60000;
 static constexpr uint32_t BLE_SETTINGS_SCAN_MS = 30000;
 static constexpr uint32_t HISTORY_SAMPLE_INTERVAL_MS = 5UL * 60UL * 1000UL;

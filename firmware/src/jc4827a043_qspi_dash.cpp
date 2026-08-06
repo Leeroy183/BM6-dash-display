@@ -681,9 +681,14 @@ void testSelectedDevice(const BleScanDevice &device)
     }
     if (result != Bm6PollResult::Ok) {
         char buffer[64];
-        snprintf(buffer, sizeof(buffer), "Not BM6: %s", pollResultText(result));
+        if (result == Bm6PollResult::ConnectFailed && device.rssi < -85) {
+            snprintf(buffer, sizeof(buffer), "Connect failed: move BM6 closer");
+        } else {
+            snprintf(buffer, sizeof(buffer), "Not BM6: %s", pollResultText(result));
+        }
         drawSettingsStatus(buffer);
-        Serial.printf("BM6 test failed for %s: %s\n", device.address, pollResultText(result));
+        Serial.printf("BM6 test failed for %s RSSI %d: %s\n",
+                      device.address, device.rssi, pollResultText(result));
         return;
     }
 

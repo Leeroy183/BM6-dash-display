@@ -131,12 +131,24 @@ Bm6PollResult Bm6Client::pollResolvedAddress(const NimBLEAddress &address, int r
         return Bm6PollResult::ConnectFailed;
     }
 
-    client->setConnectTimeout(5000);
+    client->setConnectTimeout(BM6_CONNECT_TIMEOUT_MS);
+    client->setConnectRetries(BM6_CONNECT_ATTEMPTS);
     Bm6PollResult result = Bm6PollResult::Ok;
 
-    if (!client->connect(address)) {
+    bool connected = false;
+    for (uint8_t attempt = 0; attempt < BM6_CONNECT_ATTEMPTS && !connected; ++attempt) {
+        connected = client->connect(address);
+        if (!connected) {
+            Serial.printf("BM6 connect attempt %u failed for %s\n",
+                          static_cast<unsigned>(attempt + 1), address.toString().c_str());
+            delay(350);
+        }
+    }
+
+    if (!connected) {
         result = Bm6PollResult::ConnectFailed;
     } else {
+        delay(150);
         NimBLERemoteService *service = client->getService(SERVICE_UUID);
         if (service == nullptr) {
             result = Bm6PollResult::ServiceMissing;
