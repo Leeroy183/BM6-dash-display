@@ -100,8 +100,8 @@ can prevent the dash from connecting.
 
 The QSPI dash firmware also has an on-screen settings scan. Tap the cog in the
 top-right corner to scan nearby BLE devices. Tap `SCAN` to rescan or the
-top-left back button to return to the dash. If touch calibration needs work, use
-serial commands while monitoring at 115200 baud:
+top-left back button to cancel any active scan and return to the dash. If touch
+calibration needs work, use serial commands while monitoring at 115200 baud:
 
 - `s` opens settings and scans
 - `r` rescans while on the settings screen

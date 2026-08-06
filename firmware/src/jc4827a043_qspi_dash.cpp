@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <string>
 #include "Bm6Client.h"
 #include "PersistentHistory.h"
 #include "config.h"
@@ -149,9 +150,14 @@ PersistentHistory history;
 Gt911Touch touch;
 BatteryReading latestReading;
 BleScanDevice scanDevices[MAX_SCAN_DEVICES];
+portMUX_TYPE scanDevicesMux = portMUX_INITIALIZER_UNLOCKED;
 uint8_t scanDeviceCount = 0;
 bool haveReading = false;
 bool touchWasDown = false;
+volatile bool settingsScanActive = false;
+volatile bool scanResultsDirty = false;
+uint32_t settingsScanStartedAtMs = 0;
+uint32_t lastScanDrawMs = 0;
 uint32_t nextPollAtMs = 0;
 uint32_t lastUiTickMs = 0;
 uint32_t lastChartDrawMs = 0;
@@ -162,29 +168,45 @@ class SettingsScanCallbacks : public NimBLEScanCallbacks {
   public:
     void onResult(const NimBLEAdvertisedDevice *device) override
     {
-        const char *address = device->getAddress().toString().c_str();
+        const std::string addressText = device->getAddress().toString();
+        BleScanDevice loggedDevice;
+        portENTER_CRITICAL(&scanDevicesMux);
         BleScanDevice *slot = nullptr;
         for (uint8_t i = 0; i < scanDeviceCount; ++i) {
-            if (std::strcmp(scanDevices[i].address, address) == 0) {
+            if (addressText == scanDevices[i].address) {
                 slot = &scanDevices[i];
                 break;
             }
         }
         if (slot == nullptr) {
             if (scanDeviceCount >= MAX_SCAN_DEVICES) {
+                portEXIT_CRITICAL(&scanDevicesMux);
                 return;
             }
             slot = &scanDevices[scanDeviceCount++];
-            std::strncpy(slot->address, address, sizeof(slot->address) - 1);
+            std::strncpy(slot->address, addressText.c_str(), sizeof(slot->address) - 1);
+            slot->address[sizeof(slot->address) - 1] = '\0';
         }
 
         slot->rssi = device->getRSSI();
         slot->bm6Service = device->isAdvertisingService(NimBLEUUID("0000fff0-0000-1000-8000-00805f9b34fb"));
         if (device->haveName()) {
             std::strncpy(slot->name, device->getName().c_str(), sizeof(slot->name) - 1);
+            slot->name[sizeof(slot->name) - 1] = '\0';
         }
+        scanResultsDirty = true;
+        loggedDevice = *slot;
+        portEXIT_CRITICAL(&scanDevicesMux);
         Serial.printf("BLE %s RSSI %d name=\"%s\"%s\n",
-                      slot->address, slot->rssi, slot->name, slot->bm6Service ? " BM6_SERVICE" : "");
+                      loggedDevice.address, loggedDevice.rssi, loggedDevice.name,
+                      loggedDevice.bm6Service ? " BM6_SERVICE" : "");
+    }
+
+    void onScanEnd(const NimBLEScanResults &, int reason) override
+    {
+        settingsScanActive = false;
+        scanResultsDirty = true;
+        Serial.printf("Settings BLE scan ended, reason %d\n", reason);
     }
 };
 
@@ -231,15 +253,24 @@ void clearTextArea(int x, int y, int w, int h, uint16_t color = COLOR_BLACK)
     gfx->fillRect(x, y, w, h, color);
 }
 
+void drawGearIcon(int cx, int cy, uint16_t color)
+{
+    gfx->drawCircle(cx, cy, 10, color);
+    gfx->drawCircle(cx, cy, 4, color);
+    gfx->drawLine(cx - 14, cy, cx - 10, cy, color);
+    gfx->drawLine(cx + 10, cy, cx + 14, cy, color);
+    gfx->drawLine(cx, cy - 14, cx, cy - 10, color);
+    gfx->drawLine(cx, cy + 10, cx, cy + 14, color);
+    gfx->drawLine(cx - 10, cy - 10, cx - 7, cy - 7, color);
+    gfx->drawLine(cx + 7, cy + 7, cx + 10, cy + 10, color);
+    gfx->drawLine(cx + 10, cy - 10, cx + 7, cy - 7, color);
+    gfx->drawLine(cx - 7, cy + 7, cx - 10, cy + 10, color);
+}
+
 void drawCogButton()
 {
     gfx->drawRoundRect(438, 4, 34, 34, 6, COLOR_MUTED);
-    gfx->drawCircle(455, 21, 8, COLOR_WHITE);
-    gfx->drawCircle(455, 21, 3, COLOR_WHITE);
-    gfx->drawLine(455, 9, 455, 13, COLOR_WHITE);
-    gfx->drawLine(455, 29, 455, 33, COLOR_WHITE);
-    gfx->drawLine(443, 21, 447, 21, COLOR_WHITE);
-    gfx->drawLine(463, 21, 467, 21, COLOR_WHITE);
+    drawGearIcon(455, 21, COLOR_WHITE);
 }
 
 void drawStaticLayout()
@@ -380,7 +411,16 @@ void setStatus(const char *status)
     Serial.println(currentStatus);
 }
 
-void drawSettingsHeader(const char *status)
+void drawSettingsStatus(const char *status)
+{
+    clearTextArea(12, 44, 456, 18);
+    gfx->setTextSize(1);
+    gfx->setTextColor(COLOR_MUTED, COLOR_BLACK);
+    gfx->setCursor(18, 48);
+    gfx->print(status);
+}
+
+void drawSettingsHeader()
 {
     gfx->fillScreen(COLOR_BLACK);
     gfx->drawRoundRect(8, 6, 34, 30, 6, COLOR_MUTED);
@@ -396,39 +436,43 @@ void drawSettingsHeader(const char *status)
     gfx->setTextColor(COLOR_WHITE, COLOR_BLACK);
     gfx->setCursor(386, 17);
     gfx->print("SCAN");
-
-    gfx->setTextColor(COLOR_MUTED, COLOR_BLACK);
-    gfx->setCursor(18, 48);
-    gfx->print(status);
 }
 
 void drawScanResults()
 {
-    std::sort(scanDevices, scanDevices + scanDeviceCount, [](const BleScanDevice &a, const BleScanDevice &b) {
+    BleScanDevice devices[MAX_SCAN_DEVICES];
+    uint8_t deviceCount = 0;
+    portENTER_CRITICAL(&scanDevicesMux);
+    deviceCount = scanDeviceCount;
+    std::memcpy(devices, scanDevices, sizeof(devices));
+    portEXIT_CRITICAL(&scanDevicesMux);
+
+    std::sort(devices, devices + deviceCount, [](const BleScanDevice &a, const BleScanDevice &b) {
         return a.rssi > b.rssi;
     });
 
     clearTextArea(12, 66, 456, 198);
     gfx->setTextSize(1);
-    if (scanDeviceCount == 0) {
+    if (deviceCount == 0) {
         gfx->setTextColor(COLOR_AMBER, COLOR_BLACK);
         gfx->setCursor(18, 92);
         gfx->print("No BLE devices found");
         return;
     }
 
-    for (uint8_t i = 0; i < scanDeviceCount; ++i) {
+    for (uint8_t i = 0; i < deviceCount; ++i) {
         const int y = 72 + i * 18;
-        gfx->setTextColor(scanDevices[i].bm6Service ? COLOR_GREEN : COLOR_WHITE, COLOR_BLACK);
+        clearTextArea(18, y, 438, 12);
+        gfx->setTextColor(devices[i].bm6Service ? COLOR_GREEN : COLOR_WHITE, COLOR_BLACK);
         gfx->setCursor(18, y);
-        gfx->printf("%s", scanDevices[i].address);
+        gfx->printf("%s", devices[i].address);
         gfx->setTextColor(COLOR_MUTED, COLOR_BLACK);
         gfx->setCursor(158, y);
-        gfx->printf("%4d", scanDevices[i].rssi);
+        gfx->printf("%4d", devices[i].rssi);
         gfx->setCursor(204, y);
-        const char *name = scanDevices[i].name[0] ? scanDevices[i].name : "(no name)";
+        const char *name = devices[i].name[0] ? devices[i].name : "(no name)";
         gfx->printf("%.22s", name);
-        if (scanDevices[i].bm6Service) {
+        if (devices[i].bm6Service) {
             gfx->setTextColor(COLOR_GREEN, COLOR_BLACK);
             gfx->setCursor(390, y);
             gfx->print("BM6");
@@ -436,28 +480,100 @@ void drawScanResults()
     }
 }
 
-void scanBleForSettings()
+void stopSettingsScan()
+{
+    if (!settingsScanActive) {
+        NimBLEDevice::getScan()->setMaxResults(0xff);
+        return;
+    }
+
+    NimBLEScan *scan = NimBLEDevice::getScan();
+    if (scan->isScanning()) {
+        scan->stop();
+        Serial.println("Settings BLE scan canceled");
+    }
+    scan->setScanCallbacks(nullptr, false);
+    scan->setMaxResults(0xff);
+    settingsScanActive = false;
+}
+
+void beginSettingsScan()
 {
     currentScreen = Screen::Settings;
+    stopSettingsScan();
     scanDeviceCount = 0;
-    drawSettingsHeader("Scanning nearby BLE devices...");
+    scanResultsDirty = false;
+    drawSettingsHeader();
+    drawSettingsStatus("Scanning nearby BLE devices...");
+    clearTextArea(12, 66, 456, 198);
     Serial.println("Settings BLE scan starting");
 
     bm6.begin();
+    portENTER_CRITICAL(&scanDevicesMux);
+    scanDeviceCount = 0;
+    std::memset(scanDevices, 0, sizeof(scanDevices));
+    portEXIT_CRITICAL(&scanDevicesMux);
+
     NimBLEScan *scan = NimBLEDevice::getScan();
     scan->setScanCallbacks(&settingsScanCallbacks, false);
     scan->setActiveScan(true);
     scan->setInterval(100);
     scan->setWindow(100);
-    scan->start(BLE_SETTINGS_SCAN_MS, false, true);
-    while (scan->isScanning()) {
-        delay(50);
+    scan->setMaxResults(MAX_SCAN_DEVICES);
+    settingsScanStartedAtMs = millis();
+    lastScanDrawMs = 0;
+    settingsScanActive = scan->start(BLE_SETTINGS_SCAN_MS, false, true);
+    if (!settingsScanActive) {
+        drawSettingsStatus("BLE scan failed to start");
+        scan->setScanCallbacks(nullptr, false);
+        Serial.println("Settings BLE scan failed to start");
     }
-    scan->setScanCallbacks(nullptr, false);
+}
 
-    drawSettingsHeader("Tap SCAN or send 'r' on serial to rescan");
-    drawScanResults();
-    Serial.printf("Settings BLE scan complete, %u devices\n", scanDeviceCount);
+void serviceSettingsScan()
+{
+    if (currentScreen != Screen::Settings) {
+        return;
+    }
+
+    const uint32_t now = millis();
+    if (settingsScanActive && now - settingsScanStartedAtMs > BLE_SETTINGS_SCAN_MS + 1000UL) {
+        settingsScanActive = false;
+        NimBLEDevice::getScan()->setScanCallbacks(nullptr, false);
+        NimBLEDevice::getScan()->setMaxResults(0xff);
+        scanResultsDirty = true;
+    }
+
+    if (settingsScanActive && now - lastScanDrawMs >= 1000) {
+        char buffer[52];
+        uint8_t deviceCount = 0;
+        portENTER_CRITICAL(&scanDevicesMux);
+        deviceCount = scanDeviceCount;
+        portEXIT_CRITICAL(&scanDevicesMux);
+        const uint32_t elapsed = now - settingsScanStartedAtMs;
+        const uint32_t remaining = elapsed >= BLE_SETTINGS_SCAN_MS ? 0 : (BLE_SETTINGS_SCAN_MS - elapsed + 999) / 1000;
+        snprintf(buffer, sizeof(buffer), "Scanning... %u devices | %lus left",
+                 static_cast<unsigned>(deviceCount), static_cast<unsigned long>(remaining));
+        drawSettingsStatus(buffer);
+        lastScanDrawMs = now;
+    }
+
+    if (!settingsScanActive && scanResultsDirty) {
+        NimBLEDevice::getScan()->setScanCallbacks(nullptr, false);
+        NimBLEDevice::getScan()->setMaxResults(0xff);
+        drawSettingsStatus("Tap SCAN to rescan, Back to return");
+        drawScanResults();
+        scanResultsDirty = false;
+        uint8_t deviceCount = 0;
+        portENTER_CRITICAL(&scanDevicesMux);
+        deviceCount = scanDeviceCount;
+        portEXIT_CRITICAL(&scanDevicesMux);
+        Serial.printf("Settings BLE scan complete, %u devices\n", deviceCount);
+    } else if (settingsScanActive && scanResultsDirty && now - lastScanDrawMs >= 250) {
+        drawScanResults();
+        scanResultsDirty = false;
+        lastScanDrawMs = now;
+    }
 }
 
 void pollBm6Now()
@@ -488,15 +604,17 @@ void handleTouchTap(const TouchPoint &point)
 {
     Serial.printf("Touch %d,%d\n", point.x, point.y);
     if (currentScreen == Screen::Dash && point.x >= 438 && point.y <= 40) {
-        scanBleForSettings();
+        beginSettingsScan();
         return;
     }
     if (currentScreen == Screen::Settings && point.x <= 48 && point.y <= 44) {
+        stopSettingsScan();
+        Serial.println("Settings closed");
         redrawAll();
         return;
     }
     if (currentScreen == Screen::Settings && point.x >= 352 && point.y <= 44) {
-        scanBleForSettings();
+        beginSettingsScan();
     }
 }
 
@@ -519,11 +637,13 @@ void handleSerial()
     }
     const char command = static_cast<char>(Serial.read());
     if (command == 's') {
-        scanBleForSettings();
+        beginSettingsScan();
     } else if (command == 'd') {
+        stopSettingsScan();
+        Serial.println("Settings closed");
         redrawAll();
     } else if (command == 'r' && currentScreen == Screen::Settings) {
-        scanBleForSettings();
+        beginSettingsScan();
     }
 }
 } // namespace
@@ -559,6 +679,7 @@ void loop()
     const uint32_t now = millis();
     handleSerial();
     handleTouch();
+    serviceSettingsScan();
 
     if (currentScreen == Screen::Dash && static_cast<int32_t>(now - nextPollAtMs) >= 0) {
         pollBm6Now();
