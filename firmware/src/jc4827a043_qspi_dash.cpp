@@ -51,15 +51,12 @@ class Gt911Touch {
   public:
     void begin()
     {
-        pinMode(TOUCH_RST, OUTPUT);
-        pinMode(TOUCH_INT, OUTPUT);
-        digitalWrite(TOUCH_RST, LOW);
-        digitalWrite(TOUCH_INT, LOW);
-        delay(10);
-        digitalWrite(TOUCH_RST, HIGH);
-        delay(10);
         pinMode(TOUCH_INT, INPUT);
-        delay(60);
+        pinMode(TOUCH_RST, OUTPUT);
+        digitalWrite(TOUCH_RST, LOW);
+        delay(20);
+        digitalWrite(TOUCH_RST, HIGH);
+        delay(80);
         Wire.begin(TOUCH_SDA, TOUCH_SCL);
         Wire.setClock(400000);
         if (probe(GT911_ADDR_1)) {
@@ -81,8 +78,9 @@ class Gt911Touch {
         }
     }
 
-    bool read(TouchPoint &point)
+    bool read(TouchPoint &point, bool &contact)
     {
+        contact = false;
         if (address_ == 0) {
             return false;
         }
@@ -95,7 +93,7 @@ class Gt911Touch {
         const uint8_t points = status & 0x0f;
         if (points == 0) {
             clearStatus();
-            return false;
+            return true;
         }
 
         uint8_t data[5] = {};
@@ -109,6 +107,7 @@ class Gt911Touch {
         const int16_t rawY = static_cast<int16_t>(data[3] | (data[4] << 8));
         point.x = constrain(rawX, 0, SCREEN_WIDTH - 1);
         point.y = constrain(rawY, 0, SCREEN_HEIGHT - 1);
+        contact = true;
         return true;
     }
 
@@ -185,7 +184,11 @@ portMUX_TYPE scanDevicesMux = portMUX_INITIALIZER_UNLOCKED;
 uint8_t scanDeviceCount = 0;
 bool haveReading = false;
 bool touchWasDown = false;
+uint32_t lastTouchContactAtMs = 0;
 bool bm6TargetSelected = false;
+volatile bool bm6PollActive = false;
+volatile bool bm6PollResultReady = false;
+bool settingsScanPending = false;
 volatile bool settingsScanActive = false;
 volatile bool scanResultsDirty = false;
 uint16_t settingsScanGeneration = 0;
@@ -200,6 +203,18 @@ Screen currentScreen = Screen::Dash;
 DashPage dashPage = DashPage::Overview;
 HistoryRange historyRange = HistoryRange::ThreeDays;
 uint8_t consecutivePollFailures = 0;
+
+struct Bm6PollJob {
+    char address[18] = "";
+    uint8_t addressType = 1;
+    int rssi = -127;
+    bool useDirectAddress = false;
+};
+
+portMUX_TYPE bm6PollMux = portMUX_INITIALIZER_UNLOCKED;
+Bm6PollJob bm6PollJob;
+BatteryReading bm6PendingReading;
+Bm6PollResult bm6PendingResult = Bm6PollResult::NotFound;
 
 class SettingsScanCallbacks : public NimBLEScanCallbacks {
   public:
@@ -963,6 +978,10 @@ bool loadActiveSavedDevice()
 
 bool selectSavedDeviceRelative(int8_t direction)
 {
+    if (bm6PollActive) {
+        setStatus("Battery update in progress");
+        return false;
+    }
     if (!registry.selectRelative(direction)) {
         return false;
     }
@@ -986,6 +1005,10 @@ bool saveSelectedBm6(const BleScanDevice &device)
 
 void testSelectedDevice(const BleScanDevice &device)
 {
+    if (bm6PollActive) {
+        drawSettingsStatus("Waiting for battery update...");
+        return;
+    }
     stopSettingsScan();
     drawSettingsStatus("Testing selected device as BM6...");
     delay(300);
@@ -1060,7 +1083,9 @@ void stopSettingsScan()
 void beginSettingsScan()
 {
     currentScreen = Screen::Settings;
-    stopSettingsScan();
+    if (!bm6PollActive) {
+        stopSettingsScan();
+    }
     scanResultsDirty = false;
     settingsPage = 0;
     ++settingsScanGeneration;
@@ -1075,6 +1100,14 @@ void beginSettingsScan()
     drawSettingsStatus("Scanning nearby BLE devices for 30s...");
     drawSavedDeviceBar();
     clearTextArea(12, 98, 456, 134);
+
+    if (bm6PollActive) {
+        settingsScanPending = true;
+        drawSettingsStatus("Finishing battery update, then scanning...");
+        return;
+    }
+
+    settingsScanPending = false;
     Serial.println("Settings BLE scan starting");
 
     bm6.begin();
@@ -1139,9 +1172,32 @@ void serviceSettingsScan()
     }
 }
 
-void pollBm6Now()
+void bm6PollTask(void *)
 {
-    if (currentScreen != Screen::Dash) {
+    BatteryReading reading;
+    Bm6PollResult result = bm6PollJob.useDirectAddress
+        ? bm6.pollAddress(bm6PollJob.address, bm6PollJob.addressType, bm6PollJob.rssi, reading)
+        : bm6.poll(reading);
+
+    // A saved address normally reconnects fastest directly. If that fails, an
+    // advertisement scan refreshes the address type and wakes less-cooperative units.
+    if (bm6PollJob.useDirectAddress && result != Bm6PollResult::Ok) {
+        Serial.printf("Direct BM6 poll failed (%s), trying scan fallback\n", pollResultText(result));
+        result = bm6.poll(reading);
+    }
+
+    portENTER_CRITICAL(&bm6PollMux);
+    bm6PendingReading = reading;
+    bm6PendingResult = result;
+    bm6PollResultReady = true;
+    bm6PollActive = false;
+    portEXIT_CRITICAL(&bm6PollMux);
+    vTaskDelete(nullptr);
+}
+
+void startBm6Poll()
+{
+    if (currentScreen != Screen::Dash || bm6PollActive) {
         return;
     }
     if (!bm6TargetSelected && !hasCompileTimeBm6Address()) {
@@ -1149,14 +1205,40 @@ void pollBm6Now()
         nextPollAtMs = millis() + BM6_RECONNECT_INTERVAL_MS;
         return;
     }
-    setStatus(registry.active() == nullptr ? "Scanning BM6" : "Connecting BM6");
-    BatteryReading reading;
+
+    bm6PollJob = {};
     const SavedBm6Device *savedDevice = registry.active();
-    const Bm6PollResult result = savedDevice == nullptr
-        ? bm6.poll(reading)
-        : bm6.pollAddress(savedDevice->address, savedDevice->addressType,
-                          savedDevice->lastRssi, reading);
-    setStatus(pollResultText(result));
+    if (savedDevice != nullptr) {
+        std::strncpy(bm6PollJob.address, savedDevice->address, sizeof(bm6PollJob.address) - 1);
+        bm6PollJob.addressType = savedDevice->addressType;
+        bm6PollJob.rssi = savedDevice->lastRssi;
+        bm6PollJob.useDirectAddress = true;
+    }
+
+    bm6PollResultReady = false;
+    bm6PollActive = true;
+    setStatus(savedDevice == nullptr ? "Scanning BM6" : "Updating BM6");
+    if (xTaskCreatePinnedToCore(bm6PollTask, "bm6-poll", 12288, nullptr, 1, nullptr, 0) != pdPASS) {
+        bm6PollActive = false;
+        setStatus(haveReading ? "BM6 retry pending" : "BM6 unavailable");
+        nextPollAtMs = millis() + BM6_RECONNECT_INTERVAL_MS;
+        Serial.println("Could not start BM6 poll task");
+    }
+}
+
+void serviceBm6Poll()
+{
+    if (!bm6PollResultReady) {
+        return;
+    }
+
+    BatteryReading reading;
+    Bm6PollResult result;
+    portENTER_CRITICAL(&bm6PollMux);
+    reading = bm6PendingReading;
+    result = bm6PendingResult;
+    bm6PollResultReady = false;
+    portEXIT_CRITICAL(&bm6PollMux);
 
     if (result == Bm6PollResult::Ok) {
         consecutivePollFailures = 0;
@@ -1164,13 +1246,25 @@ void pollBm6Now()
         haveReading = true;
         history.addIfDue(reading);
         registry.updateRssi(registry.activeIndex(), reading.rssi);
-        drawStatus();
-        drawDashboardPage();
+        setStatus("BM6 connected");
+        if (currentScreen == Screen::Dash) {
+            drawDashboardPage();
+        }
         Serial.printf("BM6 %.2fV %u%% %dC RSSI %d\n",
                       reading.voltage, reading.socPercent, reading.temperatureC, reading.rssi);
         nextPollAtMs = millis() + BM6_POLL_INTERVAL_MS;
     } else {
-        ++consecutivePollFailures;
+        if (consecutivePollFailures < 255) {
+            ++consecutivePollFailures;
+        }
+        if (haveReading) {
+            char status[36];
+            snprintf(status, sizeof(status), "BM6 retrying (%u)", consecutivePollFailures);
+            setStatus(status);
+        } else {
+            setStatus("BM6 unavailable - retrying");
+        }
+        Serial.printf("BM6 update failed: %s\n", pollResultText(result));
         nextPollAtMs = millis() + BM6_RECONNECT_INTERVAL_MS;
     }
 }
@@ -1220,6 +1314,10 @@ void handleTouchTap(const TouchPoint &point)
         return;
     }
     if (currentScreen == Screen::Settings && point.y >= 64 && point.y <= 96 && registry.count() > 0) {
+        if (bm6PollActive) {
+            drawSettingsStatus("Waiting for battery update...");
+            return;
+        }
         const int width = 448 / registry.count();
         if (point.x >= 16) {
             const uint8_t index = static_cast<uint8_t>((point.x - 16) / width);
@@ -1258,11 +1356,21 @@ void handleTouchTap(const TouchPoint &point)
 void handleTouch()
 {
     TouchPoint point;
-    const bool touched = touch.read(point);
-    if (touched && !touchWasDown) {
+    bool contact = false;
+    const bool updated = touch.read(point, contact);
+    if (!updated) {
+        if (touchWasDown && millis() - lastTouchContactAtMs > 250) {
+            touchWasDown = false;
+        }
+        return;
+    }
+    if (contact && !touchWasDown) {
         touchWasDown = true;
+        lastTouchContactAtMs = millis();
         handleTouchTap(point);
-    } else if (!touched) {
+    } else if (contact) {
+        lastTouchContactAtMs = millis();
+    } else if (!contact) {
         touchWasDown = false;
     }
 }
@@ -1334,7 +1442,7 @@ void setup()
 
     bm6.begin();
     if (bm6TargetSelected) {
-        pollBm6Now();
+        startBm6Poll();
     } else {
         setStatus("Select BM6 in settings");
         nextPollAtMs = millis() + BM6_RECONNECT_INTERVAL_MS;
@@ -1346,10 +1454,15 @@ void loop()
     const uint32_t now = millis();
     handleSerial();
     handleTouch();
+    serviceBm6Poll();
+    if (settingsScanPending && !bm6PollActive && currentScreen == Screen::Settings) {
+        beginSettingsScan();
+    }
     serviceSettingsScan();
 
-    if (currentScreen == Screen::Dash && static_cast<int32_t>(now - nextPollAtMs) >= 0) {
-        pollBm6Now();
+    if (currentScreen == Screen::Dash && !bm6PollActive &&
+        static_cast<int32_t>(now - nextPollAtMs) >= 0) {
+        startBm6Poll();
     }
     if (currentScreen == Screen::Dash && now - lastUiTickMs >= 1000) {
         drawStatus();
