@@ -15,14 +15,12 @@ BM6 Bluetooth car battery monitors from an ESP32-S3 touch display.
 
 The first firmware target is a 4.3 inch ESP32-S3 touch display.
 
-- Primary target under evaluation: JC4827W543 / Guition-style 4.3 inch
-  ESP32-S3 capacitive touch display
+- Primary target: JC4827A043_QSPI / Guition-style 4.3 inch ESP32-S3
+  capacitive touch display with NV3041A QSPI LCD
 - Reference target: Waveshare ESP32-S3-Touch-LCD-4.3B or 4.3B-BOX
 
-The firmware currently includes the Waveshare board target because it has strong
-library support and public board definitions. A JC4827W543 target will be added
-next so the lower-cost integrated ESP32-S3 display can become the main dash
-build.
+The connected AliExpress display has been verified as the QSPI/NV3041A variant.
+It is the main dash build target for the first in-car prototype.
 
 ## Repository layout
 
@@ -39,23 +37,25 @@ The first standalone firmware can:
 - subscribe to the BM6 notification characteristic
 - send the BM6 read command
 - decrypt and parse voltage, temperature, and state of charge
-- draw a local LVGL dash screen with rolling voltage history
+- draw a local dash screen on the QSPI display
+- keep a persistent 3-day ring buffer of voltage, state of charge, and
+  temperature samples
 
-This is ready for first hardware compilation and BM6 testing. Persistent
-history, multi-battery screens, touch navigation, and the JC4827W543 board
-target are planned next.
+Multi-battery screens, touch navigation, and STL housing files are planned next.
 
 ## Build
 
 Install PlatformIO, then from `firmware/`:
 
 ```powershell
-pio run
-pio run -t upload
-pio device monitor
+pio run -e jc4827a043_qspi_dash
+pio run -e jc4827a043_qspi_dash -t upload
+pio device monitor -e jc4827a043_qspi_dash
 ```
 
 Before flashing, edit `firmware/src/config.h` and set your BM6 MAC address.
+Leave it as `00:00:00:00:00:00` only when scanning by the advertised name
+`BM6`.
 
 ## License
 

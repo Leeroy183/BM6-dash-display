@@ -11,6 +11,7 @@ namespace {
 constexpr char SERVICE_UUID[] = "0000fff0-0000-1000-8000-00805f9b34fb";
 constexpr char WRITE_UUID[] = "0000fff3-0000-1000-8000-00805f9b34fb";
 constexpr char NOTIFY_UUID[] = "0000fff4-0000-1000-8000-00805f9b34fb";
+const NimBLEUUID BM6_SERVICE_UUID(SERVICE_UUID);
 
 constexpr uint8_t AES_KEY[16] = {
     108, 101, 97, 103, 101, 110, 100, 255,
@@ -47,8 +48,9 @@ class Bm6Client::ScanCallbacks : public NimBLEScanCallbacks {
         const bool addressMatches = hasConfiguredAddress() && address == configured;
         const bool nameMatches = !hasConfiguredAddress() && device->haveName() &&
                                  device->getName() == BM6_ADVERTISED_NAME;
+        const bool serviceMatches = !hasConfiguredAddress() && device->isAdvertisingService(BM6_SERVICE_UUID);
 
-        if (!addressMatches && !nameMatches) {
+        if (!addressMatches && !nameMatches && !serviceMatches) {
             return;
         }
 

@@ -10,11 +10,11 @@ the BM6 phone app.
 - connects and requests the live battery packet
 - decrypts the BM6 response on the ESP32
 - shows voltage, state of charge, temperature, and connection status
-- keeps an in-memory rolling voltage history and plots it on the display
+- keeps a persistent 3-day rolling history and plots it on the display
 
-The history is RAM-backed for this first standalone version, so it resets when
-the dash loses power. Persistent local history is the next logical step once the
-board is confirmed with the real BM6.
+History is stored in ESP32 NVS as 5-minute samples. The current single-battery
+configuration stores 864 samples, covering 3 days of voltage, state of charge,
+and temperature while the dash firmware is polling the BM6.
 
 ## Hardware targets
 
@@ -48,15 +48,16 @@ single BLE central connection at a time.
 
 ## Build and flash
 
-From this folder:
+For the connected QSPI/NV3041A display, from this folder:
 
 ```powershell
-pio run -t upload
-pio device monitor
+pio run -e jc4827a043_qspi_dash
+pio run -e jc4827a043_qspi_dash -t upload
+pio device monitor -e jc4827a043_qspi_dash
 ```
 
-If PlatformIO asks for a port, put the Waveshare board into USB flashing mode
-and retry.
+If PlatformIO asks for a port, select the display USB serial port. The current
+test unit appears as `COM5` on this PC.
 
 ## JC4827W543 smoke test
 
@@ -72,3 +73,17 @@ pio device monitor -e jc4827a043_qspi_smoke
 The screen should show color bars with a black status panel. Serial output
 should print `JC4827A043 QSPI smoke test starting`, `QSPI display smoke screen
 drawn`, and a heartbeat once per second.
+
+## BLE scan diagnostic
+
+If the dash says `BM6 not found`, close the BM6 phone app and run the BLE scan
+diagnostic:
+
+```powershell
+pio run -e ble_scan_debug -t upload
+pio device monitor -e ble_scan_debug
+```
+
+Use the BM6 MAC address from the scan output or the phone app in
+`src/config.h`. The BM6 usually accepts only one active BLE central, so the app
+can prevent the dash from connecting.
