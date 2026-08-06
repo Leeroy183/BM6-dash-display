@@ -18,8 +18,8 @@ constexpr uint8_t AES_KEY[16] = {
 };
 
 constexpr uint8_t READ_COMMAND[16] = {
-    0x69, 0x7e, 0xc5, 0x89, 0x20, 0x17, 0xe9, 0xfe,
-    0xab, 0x1c, 0x0a, 0xf6, 0xfd, 0xe8, 0x14, 0x14
+    0x69, 0x7e, 0xa0, 0xb5, 0xd5, 0x4c, 0xf0, 0x24,
+    0xe7, 0x94, 0x77, 0x23, 0x55, 0x55, 0x41, 0x14
 };
 
 bool hasAddress(const char *address)
@@ -168,24 +168,30 @@ Bm6PollResult Bm6Client::pollResolvedAddress(const NimBLEAddress &address, int r
 
                 if (!subscribed) {
                     result = Bm6PollResult::SubscribeFailed;
-                } else if (!writer->writeValue(READ_COMMAND, sizeof(READ_COMMAND), false)) {
+                } else if (!writer->writeValue(READ_COMMAND, sizeof(READ_COMMAND), true)) {
                     result = Bm6PollResult::WriteFailed;
                 } else {
                     const uint32_t started = millis();
-                    while (!packetReady_ && millis() - started < BM6_PACKET_TIMEOUT_MS) {
-                        delay(20);
-                    }
+                    bool sawInvalidPacket = false;
+                    result = Bm6PollResult::Timeout;
+                    while (millis() - started < BM6_PACKET_TIMEOUT_MS) {
+                        if (!packetReady_) {
+                            delay(20);
+                            continue;
+                        }
 
-                    if (packetReady_) {
+                        packetReady_ = false;
                         if (packetToReading(encryptedPacket_, sizeof(encryptedPacket_), reading)) {
                             reading.rssi = rssi;
                             reading.sampledAtMs = millis();
                             result = Bm6PollResult::Ok;
+                            break;
                         } else {
-                            result = Bm6PollResult::InvalidPacket;
+                            sawInvalidPacket = true;
                         }
-                    } else {
-                        result = Bm6PollResult::Timeout;
+                    }
+                    if (result == Bm6PollResult::Timeout && sawInvalidPacket) {
+                        result = Bm6PollResult::InvalidPacket;
                     }
 
                     notifier->unsubscribe(false);
@@ -271,6 +277,11 @@ bool Bm6Client::packetToReading(const uint8_t *encrypted, size_t length, Battery
     }
 
     if (decrypted[0] != 0xd1 || decrypted[1] != 0x55 || decrypted[2] != 0x07) {
+        Serial.print("BM6 ignored decrypted packet:");
+        for (size_t i = 0; i < length; ++i) {
+            Serial.printf(" %02x", decrypted[i]);
+        }
+        Serial.println();
         return false;
     }
 

@@ -670,13 +670,16 @@ void testSelectedDevice(const BleScanDevice &device)
 
     BatteryReading reading;
     Bm6PollResult result = bm6.pollAddress(device.address, device.addressType, reading);
+    Bm6PollResult firstResult = result;
     uint8_t addressType = device.addressType;
-    if (result != Bm6PollResult::Ok) {
+    if (result == Bm6PollResult::ConnectFailed || result == Bm6PollResult::ServiceMissing) {
         const uint8_t alternateType = device.addressType == 0 ? 1 : 0;
         Serial.printf("BM6 test retry for %s with address type %u\n", device.address, alternateType);
         result = bm6.pollAddress(device.address, alternateType, reading);
         if (result == Bm6PollResult::Ok) {
             addressType = alternateType;
+        } else if (firstResult != Bm6PollResult::ConnectFailed && result == Bm6PollResult::ConnectFailed) {
+            result = firstResult;
         }
     }
     if (result != Bm6PollResult::Ok) {
