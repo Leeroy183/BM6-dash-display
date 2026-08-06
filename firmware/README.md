@@ -19,7 +19,9 @@ board is confirmed with the real BM6.
 ## Hardware targets
 
 - Current firmware target: Waveshare ESP32-S3-Touch-LCD-4.3B or 4.3B-BOX
-- Smoke-test target: JC4827W543 / Guition-style 4.3 inch ESP32-S3 touch display
+- Working smoke-test target: JC4827A043_QSPI / JC4827W543-style 4.3 inch
+  ESP32-S3 touch display with NV3041A QSPI LCD
+- Alternate test target: JC4827W543 / ESP32_4827S043 RGB LCD profile
 - BM6 BLE battery monitor
 - fused automotive accessory/ignition feed through a suitable automotive power
   supply
@@ -28,9 +30,9 @@ The Waveshare board is used through Espressif's `ESP32_Display_Panel` board
 support package. The board definition enables the 800 x 480 RGB display, GT911
 touch controller, CH422G I/O expander, and backlight handling.
 
-The JC4827W543 target uses a lower 480 x 272 resolution and different
-power/display wiring. A color-bar smoke test is available now; full LVGL dash UI
-support is the next step.
+The connected test screen was confirmed as the QSPI/NV3041A variant. It uses a
+480 x 272 display, 4 MB flash, 8 MB PSRAM, QSPI LCD pins, and backlight on
+GPIO1. Full LVGL dash UI support is the next step.
 
 ## Configure
 
@@ -58,15 +60,15 @@ and retry.
 
 ## JC4827W543 smoke test
 
-For the AliExpress/Guition-style 4.3 inch ESP32-S3 screen, start with the
-standalone color-bar smoke test:
+For the confirmed AliExpress/Guition-style 4.3 inch ESP32-S3 screen, start with
+the QSPI color-bar smoke test:
 
 ```powershell
-pio run -e jc4827w543_smoke
-pio run -e jc4827w543_smoke -t upload
-pio device monitor -e jc4827w543_smoke
+pio run -e jc4827a043_qspi_smoke
+pio run -e jc4827a043_qspi_smoke -t upload
+pio device monitor -e jc4827a043_qspi_smoke
 ```
 
 The screen should show color bars with a black status panel. Serial output
-should print `JC4827W543 smoke test starting`, `Display smoke screen drawn`, and
-a heartbeat once per second.
+should print `JC4827A043 QSPI smoke test starting`, `QSPI display smoke screen
+drawn`, and a heartbeat once per second.
