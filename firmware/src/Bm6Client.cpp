@@ -132,7 +132,7 @@ Bm6PollResult Bm6Client::pollResolvedAddress(const NimBLEAddress &address, int r
     }
 
     client->setConnectTimeout(BM6_CONNECT_TIMEOUT_MS);
-    client->setConnectRetries(BM6_CONNECT_ATTEMPTS);
+    client->setConnectRetries(0);
     Bm6PollResult result = Bm6PollResult::Ok;
 
     bool connected = false;
@@ -182,7 +182,8 @@ Bm6PollResult Bm6Client::pollResolvedAddress(const NimBLEAddress &address, int r
 
                         packetReady_ = false;
                         if (packetToReading(encryptedPacket_, sizeof(encryptedPacket_), reading)) {
-                            reading.rssi = rssi;
+                            const int connectedRssi = client->getRssi();
+                            reading.rssi = connectedRssi == 0 ? rssi : connectedRssi;
                             reading.sampledAtMs = millis();
                             result = Bm6PollResult::Ok;
                             break;

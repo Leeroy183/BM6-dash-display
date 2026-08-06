@@ -51,12 +51,15 @@ class Gt911Touch {
   public:
     void begin()
     {
-        pinMode(TOUCH_INT, INPUT);
         pinMode(TOUCH_RST, OUTPUT);
+        pinMode(TOUCH_INT, OUTPUT);
         digitalWrite(TOUCH_RST, LOW);
-        delay(20);
+        digitalWrite(TOUCH_INT, LOW);
+        delay(10);
         digitalWrite(TOUCH_RST, HIGH);
-        delay(80);
+        delay(10);
+        pinMode(TOUCH_INT, INPUT);
+        delay(60);
         Wire.begin(TOUCH_SDA, TOUCH_SCL);
         Wire.setClock(400000);
         if (probe(GT911_ADDR_1)) {
@@ -66,6 +69,13 @@ class Gt911Touch {
         }
         if (address_ != 0) {
             Serial.printf("GT911 touch found at 0x%02x\n", address_);
+            clearStatus();
+            uint8_t resolution[4] = {};
+            if (readBytes(0x8048, resolution, sizeof(resolution))) {
+                const uint16_t width = resolution[0] | (resolution[1] << 8);
+                const uint16_t height = resolution[2] | (resolution[3] << 8);
+                Serial.printf("GT911 configured resolution %ux%u\n", width, height);
+            }
         } else {
             Serial.println("GT911 touch not found");
         }
@@ -1139,9 +1149,13 @@ void pollBm6Now()
         nextPollAtMs = millis() + BM6_RECONNECT_INTERVAL_MS;
         return;
     }
-    setStatus("Scanning BM6");
+    setStatus(registry.active() == nullptr ? "Scanning BM6" : "Connecting BM6");
     BatteryReading reading;
-    const Bm6PollResult result = bm6.poll(reading);
+    const SavedBm6Device *savedDevice = registry.active();
+    const Bm6PollResult result = savedDevice == nullptr
+        ? bm6.poll(reading)
+        : bm6.pollAddress(savedDevice->address, savedDevice->addressType,
+                          savedDevice->lastRssi, reading);
     setStatus(pollResultText(result));
 
     if (result == Bm6PollResult::Ok) {
@@ -1305,7 +1319,7 @@ void setup()
         Serial.println("Display begin failed");
         return;
     }
-    gfx->invertDisplay(true);
+    gfx->invertDisplay(false);
     gfx->setRotation(2);
     touch.begin();
 
