@@ -32,7 +32,8 @@ constexpr uint16_t COLOR_CYAN = 0x07ff;
 constexpr uint8_t GT911_ADDR_1 = 0x5d;
 constexpr uint8_t GT911_ADDR_2 = 0x14;
 constexpr uint16_t GT911_POINT_STATUS = 0x814e;
-constexpr uint8_t MAX_SCAN_DEVICES = 10;
+constexpr uint8_t MAX_SCAN_DEVICES = 32;
+constexpr uint8_t SETTINGS_ROWS_PER_PAGE = 9;
 
 Arduino_DataBus *bus = new Arduino_ESP32QSPI(
     45 /* CS */, 47 /* SCK */, 21 /* D0 */, 48 /* D1 */, 40 /* D2 */, 39 /* D3 */
@@ -85,15 +86,15 @@ class Gt911Touch {
             return false;
         }
 
-        uint8_t data[4] = {};
+        uint8_t data[5] = {};
         if (!readBytes(0x814f, data, sizeof(data))) {
             clearStatus();
             return false;
         }
         clearStatus();
 
-        const int16_t rawX = static_cast<int16_t>(data[0] | (data[1] << 8));
-        const int16_t rawY = static_cast<int16_t>(data[2] | (data[3] << 8));
+        const int16_t rawX = static_cast<int16_t>(data[1] | (data[2] << 8));
+        const int16_t rawY = static_cast<int16_t>(data[3] | (data[4] << 8));
         point.x = constrain(SCREEN_WIDTH - 1 - rawX, 0, SCREEN_WIDTH - 1);
         point.y = constrain(SCREEN_HEIGHT - 1 - rawY, 0, SCREEN_HEIGHT - 1);
         return true;
@@ -140,6 +141,8 @@ struct BleScanDevice {
     char name[24] = "";
     int rssi = -127;
     uint8_t addressType = 1;
+    uint16_t firstSeenScan = 0;
+    uint16_t lastSeenScan = 0;
     bool bm6Service = false;
 };
 
@@ -158,8 +161,11 @@ portMUX_TYPE scanDevicesMux = portMUX_INITIALIZER_UNLOCKED;
 uint8_t scanDeviceCount = 0;
 bool haveReading = false;
 bool touchWasDown = false;
+bool bm6TargetSelected = false;
 volatile bool settingsScanActive = false;
 volatile bool scanResultsDirty = false;
+uint16_t settingsScanGeneration = 0;
+uint8_t settingsPage = 0;
 uint32_t settingsScanStartedAtMs = 0;
 uint32_t lastScanDrawMs = 0;
 uint32_t nextPollAtMs = 0;
@@ -184,16 +190,33 @@ class SettingsScanCallbacks : public NimBLEScanCallbacks {
         }
         if (slot == nullptr) {
             if (scanDeviceCount >= MAX_SCAN_DEVICES) {
-                portEXIT_CRITICAL(&scanDevicesMux);
-                return;
+                uint8_t replaceIndex = 0;
+                for (uint8_t i = 1; i < scanDeviceCount; ++i) {
+                    const bool iIsStale = scanDevices[i].lastSeenScan != settingsScanGeneration;
+                    const bool replaceIsStale = scanDevices[replaceIndex].lastSeenScan != settingsScanGeneration;
+                    if ((iIsStale && !replaceIsStale) ||
+                        (iIsStale == replaceIsStale && scanDevices[i].rssi < scanDevices[replaceIndex].rssi)) {
+                        replaceIndex = i;
+                    }
+                }
+                if (scanDevices[replaceIndex].lastSeenScan == settingsScanGeneration &&
+                    device->getRSSI() <= scanDevices[replaceIndex].rssi) {
+                    portEXIT_CRITICAL(&scanDevicesMux);
+                    return;
+                }
+                slot = &scanDevices[replaceIndex];
+                *slot = {};
+            } else {
+                slot = &scanDevices[scanDeviceCount++];
             }
-            slot = &scanDevices[scanDeviceCount++];
             std::strncpy(slot->address, addressText.c_str(), sizeof(slot->address) - 1);
             slot->address[sizeof(slot->address) - 1] = '\0';
+            slot->firstSeenScan = settingsScanGeneration;
         }
 
         slot->rssi = device->getRSSI();
         slot->addressType = device->getAddress().getType();
+        slot->lastSeenScan = settingsScanGeneration;
         slot->bm6Service = device->isAdvertisingService(NimBLEUUID("0000fff0-0000-1000-8000-00805f9b34fb"));
         if (device->haveName()) {
             std::strncpy(slot->name, device->getName().c_str(), sizeof(slot->name) - 1);
@@ -246,6 +269,16 @@ bool shouldSkipDeviceTest(const BleScanDevice &device)
            containsInsensitive(device.name, "dexcom") ||
            containsInsensitive(device.name, "dxcm") ||
            containsInsensitive(device.name, "omnipod");
+}
+
+bool hasCompileTimeBm6Address()
+{
+    return std::strcmp(BM6_MAC_ADDRESS, "00:00:00:00:00:00") != 0;
+}
+
+bool isNewThisScan(const BleScanDevice &device)
+{
+    return settingsScanGeneration > 1 && device.firstSeenScan == settingsScanGeneration;
 }
 
 uint16_t voltageColor(float voltage)
@@ -476,14 +509,61 @@ void drawSettingsHeader()
 
 void copySortedScanDevices(BleScanDevice *devices, uint8_t &deviceCount)
 {
+    BleScanDevice allDevices[MAX_SCAN_DEVICES];
+    uint8_t allDeviceCount = 0;
     portENTER_CRITICAL(&scanDevicesMux);
-    deviceCount = scanDeviceCount;
-    std::memcpy(devices, scanDevices, sizeof(scanDevices));
+    allDeviceCount = scanDeviceCount;
+    std::memcpy(allDevices, scanDevices, sizeof(allDevices));
     portEXIT_CRITICAL(&scanDevicesMux);
 
+    deviceCount = 0;
+    for (uint8_t i = 0; i < allDeviceCount; ++i) {
+        if (allDevices[i].lastSeenScan == settingsScanGeneration) {
+            devices[deviceCount++] = allDevices[i];
+        }
+    }
+
     std::sort(devices, devices + deviceCount, [](const BleScanDevice &a, const BleScanDevice &b) {
+        if (a.bm6Service != b.bm6Service) {
+            return a.bm6Service;
+        }
+        if (isNewThisScan(a) != isNewThisScan(b)) {
+            return isNewThisScan(a);
+        }
+        if (shouldSkipDeviceTest(a) != shouldSkipDeviceTest(b)) {
+            return !shouldSkipDeviceTest(a);
+        }
         return a.rssi > b.rssi;
     });
+}
+
+uint8_t settingsPageCount(uint8_t deviceCount)
+{
+    return std::max<uint8_t>(1, (deviceCount + SETTINGS_ROWS_PER_PAGE - 1) / SETTINGS_ROWS_PER_PAGE);
+}
+
+void drawPageControls(uint8_t deviceCount)
+{
+    const uint8_t pageCount = settingsPageCount(deviceCount);
+    if (settingsPage >= pageCount) {
+        settingsPage = pageCount - 1;
+    }
+
+    clearTextArea(12, 236, 456, 28);
+    gfx->setTextSize(1);
+    gfx->drawRoundRect(16, 238, 78, 24, 5, settingsPage > 0 ? COLOR_MUTED : COLOR_PANEL);
+    gfx->setTextColor(settingsPage > 0 ? COLOR_WHITE : COLOR_MUTED, COLOR_BLACK);
+    gfx->setCursor(36, 246);
+    gfx->print("PREV");
+
+    gfx->setTextColor(COLOR_MUTED, COLOR_BLACK);
+    gfx->setCursor(198, 246);
+    gfx->printf("Page %u/%u", static_cast<unsigned>(settingsPage + 1), static_cast<unsigned>(pageCount));
+
+    gfx->drawRoundRect(386, 238, 78, 24, 5, settingsPage + 1 < pageCount ? COLOR_MUTED : COLOR_PANEL);
+    gfx->setTextColor(settingsPage + 1 < pageCount ? COLOR_WHITE : COLOR_MUTED, COLOR_BLACK);
+    gfx->setCursor(410, 246);
+    gfx->print("NEXT");
 }
 
 void drawScanResults()
@@ -492,47 +572,57 @@ void drawScanResults()
     uint8_t deviceCount = 0;
     copySortedScanDevices(devices, deviceCount);
 
-    clearTextArea(12, 66, 456, 198);
+    clearTextArea(12, 66, 456, 166);
     gfx->setTextSize(1);
     if (deviceCount == 0) {
         gfx->setTextColor(COLOR_AMBER, COLOR_BLACK);
         gfx->setCursor(18, 92);
         gfx->print("No BLE devices found");
+        drawPageControls(deviceCount);
         return;
     }
 
-    for (uint8_t i = 0; i < deviceCount; ++i) {
-        const int y = 72 + i * 18;
+    const uint8_t start = settingsPage * SETTINGS_ROWS_PER_PAGE;
+    const uint8_t end = std::min<uint8_t>(deviceCount, start + SETTINGS_ROWS_PER_PAGE);
+    for (uint8_t i = start; i < end; ++i) {
+        const uint8_t visibleRow = i - start;
+        const int y = 72 + visibleRow * 18;
         clearTextArea(18, y, 438, 12);
         const bool skipped = shouldSkipDeviceTest(devices[i]);
         gfx->setTextColor(devices[i].bm6Service ? COLOR_GREEN : (skipped ? COLOR_AMBER : COLOR_WHITE), COLOR_BLACK);
         gfx->setCursor(18, y);
-        gfx->printf("%s", devices[i].address);
+        gfx->printf("%u %s", static_cast<unsigned>(visibleRow + 1), devices[i].address);
         gfx->setTextColor(COLOR_MUTED, COLOR_BLACK);
-        gfx->setCursor(158, y);
+        gfx->setCursor(174, y);
         gfx->printf("%4d", devices[i].rssi);
-        gfx->setCursor(204, y);
+        gfx->setCursor(220, y);
         const char *name = devices[i].name[0] ? devices[i].name : "(no name)";
-        gfx->printf("%.22s", name);
+        gfx->printf("%.18s", name);
         if (devices[i].bm6Service) {
             gfx->setTextColor(COLOR_GREEN, COLOR_BLACK);
             gfx->setCursor(390, y);
             gfx->print("BM6");
+        } else if (isNewThisScan(devices[i])) {
+            gfx->setTextColor(COLOR_CYAN, COLOR_BLACK);
+            gfx->setCursor(390, y);
+            gfx->print("NEW");
         } else if (skipped) {
             gfx->setTextColor(COLOR_AMBER, COLOR_BLACK);
             gfx->setCursor(390, y);
             gfx->print("SKIP");
         }
     }
+    drawPageControls(deviceCount);
 }
 
 bool scanDeviceAtPoint(const TouchPoint &point, BleScanDevice &device)
 {
-    if (point.y < 72 || point.y >= 252) {
+    if (point.y < 72 || point.y >= 72 + SETTINGS_ROWS_PER_PAGE * 18) {
         return false;
     }
 
-    const uint8_t row = static_cast<uint8_t>((point.y - 72) / 18);
+    const uint8_t visibleRow = static_cast<uint8_t>((point.y - 72) / 18);
+    const uint8_t row = settingsPage * SETTINGS_ROWS_PER_PAGE + visibleRow;
     BleScanDevice devices[MAX_SCAN_DEVICES];
     uint8_t deviceCount = 0;
     copySortedScanDevices(devices, deviceCount);
@@ -546,6 +636,7 @@ bool scanDeviceAtPoint(const TouchPoint &point, BleScanDevice &device)
 
 bool scanDeviceAtRow(uint8_t row, BleScanDevice &device)
 {
+    row = settingsPage * SETTINGS_ROWS_PER_PAGE + row;
     BleScanDevice devices[MAX_SCAN_DEVICES];
     uint8_t deviceCount = 0;
     copySortedScanDevices(devices, deviceCount);
@@ -562,12 +653,14 @@ void saveSelectedBm6(const BleScanDevice &device)
     configPrefs.putString("addr", device.address);
     configPrefs.putUChar("atype", device.addressType);
     bm6.setPreferredAddress(device.address, device.addressType);
+    bm6TargetSelected = true;
 }
 
 void testSelectedDevice(const BleScanDevice &device)
 {
     stopSettingsScan();
     drawSettingsStatus("Testing selected device as BM6...");
+    delay(300);
 
     if (shouldSkipDeviceTest(device)) {
         drawSettingsStatus("Skipped named medical device");
@@ -576,7 +669,16 @@ void testSelectedDevice(const BleScanDevice &device)
     }
 
     BatteryReading reading;
-    const Bm6PollResult result = bm6.pollAddress(device.address, device.addressType, reading);
+    Bm6PollResult result = bm6.pollAddress(device.address, device.addressType, reading);
+    uint8_t addressType = device.addressType;
+    if (result != Bm6PollResult::Ok) {
+        const uint8_t alternateType = device.addressType == 0 ? 1 : 0;
+        Serial.printf("BM6 test retry for %s with address type %u\n", device.address, alternateType);
+        result = bm6.pollAddress(device.address, alternateType, reading);
+        if (result == Bm6PollResult::Ok) {
+            addressType = alternateType;
+        }
+    }
     if (result != Bm6PollResult::Ok) {
         char buffer[64];
         snprintf(buffer, sizeof(buffer), "Not BM6: %s", pollResultText(result));
@@ -585,7 +687,9 @@ void testSelectedDevice(const BleScanDevice &device)
         return;
     }
 
-    saveSelectedBm6(device);
+    BleScanDevice selected = device;
+    selected.addressType = addressType;
+    saveSelectedBm6(selected);
     latestReading = reading;
     haveReading = true;
     history.addIfDue(reading);
@@ -594,7 +698,7 @@ void testSelectedDevice(const BleScanDevice &device)
     snprintf(buffer, sizeof(buffer), "Saved BM6 %s %.2fV", device.address, reading.voltage);
     drawSettingsStatus(buffer);
     Serial.printf("Saved BM6 %s type %u %.2fV %u%% %dC\n",
-                  device.address, device.addressType, reading.voltage, reading.socPercent, reading.temperatureC);
+                  device.address, addressType, reading.voltage, reading.socPercent, reading.temperatureC);
 }
 
 void stopSettingsScan()
@@ -618,18 +722,22 @@ void beginSettingsScan()
 {
     currentScreen = Screen::Settings;
     stopSettingsScan();
-    scanDeviceCount = 0;
     scanResultsDirty = false;
+    settingsPage = 0;
+    ++settingsScanGeneration;
+    if (settingsScanGeneration == 0) {
+        settingsScanGeneration = 1;
+        portENTER_CRITICAL(&scanDevicesMux);
+        scanDeviceCount = 0;
+        std::memset(scanDevices, 0, sizeof(scanDevices));
+        portEXIT_CRITICAL(&scanDevicesMux);
+    }
     drawSettingsHeader();
-    drawSettingsStatus("Scanning nearby BLE devices...");
+    drawSettingsStatus("Scanning nearby BLE devices for 30s...");
     clearTextArea(12, 66, 456, 198);
     Serial.println("Settings BLE scan starting");
 
     bm6.begin();
-    portENTER_CRITICAL(&scanDevicesMux);
-    scanDeviceCount = 0;
-    std::memset(scanDevices, 0, sizeof(scanDevices));
-    portEXIT_CRITICAL(&scanDevicesMux);
 
     NimBLEScan *scan = NimBLEDevice::getScan();
     scan->setScanCallbacks(&settingsScanCallbacks, false);
@@ -663,10 +771,9 @@ void serviceSettingsScan()
 
     if (settingsScanActive && now - lastScanDrawMs >= 1000) {
         char buffer[52];
+        BleScanDevice devices[MAX_SCAN_DEVICES];
         uint8_t deviceCount = 0;
-        portENTER_CRITICAL(&scanDevicesMux);
-        deviceCount = scanDeviceCount;
-        portEXIT_CRITICAL(&scanDevicesMux);
+        copySortedScanDevices(devices, deviceCount);
         const uint32_t elapsed = now - settingsScanStartedAtMs;
         const uint32_t remaining = elapsed >= BLE_SETTINGS_SCAN_MS ? 0 : (BLE_SETTINGS_SCAN_MS - elapsed + 999) / 1000;
         snprintf(buffer, sizeof(buffer), "Scanning... %u devices | %lus left",
@@ -681,10 +788,9 @@ void serviceSettingsScan()
         drawSettingsStatus("Tap row to test BM6, SCAN to rescan");
         drawScanResults();
         scanResultsDirty = false;
+        BleScanDevice devices[MAX_SCAN_DEVICES];
         uint8_t deviceCount = 0;
-        portENTER_CRITICAL(&scanDevicesMux);
-        deviceCount = scanDeviceCount;
-        portEXIT_CRITICAL(&scanDevicesMux);
+        copySortedScanDevices(devices, deviceCount);
         Serial.printf("Settings BLE scan complete, %u devices\n", deviceCount);
     } else if (settingsScanActive && scanResultsDirty && now - lastScanDrawMs >= 250) {
         drawScanResults();
@@ -696,6 +802,12 @@ void serviceSettingsScan()
 void pollBm6Now()
 {
     if (currentScreen != Screen::Dash) {
+        return;
+    }
+    if (!bm6TargetSelected && !hasCompileTimeBm6Address()) {
+        setStatus("Select BM6 in settings");
+        nextPollAtMs = millis() + BM6_POLL_INTERVAL_MS;
+        drawFooter();
         return;
     }
     setStatus("Scanning BM6");
@@ -724,14 +836,28 @@ void handleTouchTap(const TouchPoint &point)
         beginSettingsScan();
         return;
     }
-    if (currentScreen == Screen::Settings && point.x <= 48 && point.y <= 44) {
+    if (currentScreen == Screen::Settings && point.x >= 8 && point.x <= 42 && point.y >= 6 && point.y <= 36) {
         stopSettingsScan();
         Serial.println("Settings closed");
         redrawAll();
         return;
     }
-    if (currentScreen == Screen::Settings && point.x >= 352 && point.y <= 44) {
+    if (currentScreen == Screen::Settings && point.x >= 362 && point.x <= 466 && point.y >= 6 && point.y <= 36) {
         beginSettingsScan();
+        return;
+    }
+    if (currentScreen == Screen::Settings && point.y >= 238 && point.y <= 262) {
+        BleScanDevice devices[MAX_SCAN_DEVICES];
+        uint8_t deviceCount = 0;
+        copySortedScanDevices(devices, deviceCount);
+        const uint8_t pageCount = settingsPageCount(deviceCount);
+        if (point.x >= 16 && point.x <= 94 && settingsPage > 0) {
+            --settingsPage;
+            drawScanResults();
+        } else if (point.x >= 386 && point.x <= 464 && settingsPage + 1 < pageCount) {
+            ++settingsPage;
+            drawScanResults();
+        }
         return;
     }
 
@@ -772,6 +898,18 @@ void handleSerial()
         if (scanDeviceAtRow(static_cast<uint8_t>(command - '1'), selected)) {
             testSelectedDevice(selected);
         }
+    } else if ((command == 'n' || command == 'p') && currentScreen == Screen::Settings) {
+        BleScanDevice devices[MAX_SCAN_DEVICES];
+        uint8_t deviceCount = 0;
+        copySortedScanDevices(devices, deviceCount);
+        const uint8_t pageCount = settingsPageCount(deviceCount);
+        if (command == 'n' && settingsPage + 1 < pageCount) {
+            ++settingsPage;
+            drawScanResults();
+        } else if (command == 'p' && settingsPage > 0) {
+            --settingsPage;
+            drawScanResults();
+        }
     }
 }
 } // namespace
@@ -804,12 +942,22 @@ void setup()
         if (savedAddress.length() == 17) {
             const uint8_t savedAddressType = configPrefs.getUChar("atype", 1);
             bm6.setPreferredAddress(savedAddress.c_str(), savedAddressType);
+            bm6TargetSelected = true;
             Serial.printf("Loaded saved BM6 %s type %u\n", savedAddress.c_str(), savedAddressType);
         }
     }
+    if (hasCompileTimeBm6Address()) {
+        bm6TargetSelected = true;
+    }
 
     bm6.begin();
-    pollBm6Now();
+    if (bm6TargetSelected) {
+        pollBm6Now();
+    } else {
+        setStatus("Select BM6 in settings");
+        nextPollAtMs = millis() + BM6_POLL_INTERVAL_MS;
+        drawFooter();
+    }
 }
 
 void loop()
