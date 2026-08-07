@@ -110,6 +110,23 @@ bool SavedBm6Registry::selectRelative(int8_t direction)
     return select(static_cast<uint8_t>(next));
 }
 
+bool SavedBm6Registry::rename(uint8_t index, const char *name)
+{
+    if (index >= state_.count || name == nullptr || name[0] == '\0') {
+        return false;
+    }
+
+    char previousName[sizeof(state_.devices[index].name)] = "";
+    std::strncpy(previousName, state_.devices[index].name, sizeof(previousName) - 1);
+    std::strncpy(state_.devices[index].name, name, sizeof(state_.devices[index].name) - 1);
+    state_.devices[index].name[sizeof(state_.devices[index].name) - 1] = '\0';
+    if (save()) {
+        return true;
+    }
+    std::strncpy(state_.devices[index].name, previousName, sizeof(state_.devices[index].name));
+    return false;
+}
+
 bool SavedBm6Registry::updateRssi(uint8_t index, int rssi)
 {
     if (index >= state_.count) {

@@ -24,6 +24,7 @@ class SavedBm6Registry {
     int8_t addOrSelect(const char *address, uint8_t addressType, const char *advertisedName, int rssi);
     bool select(uint8_t index);
     bool selectRelative(int8_t direction);
+    bool rename(uint8_t index, const char *name);
     bool updateRssi(uint8_t index, int rssi);
 
   private:

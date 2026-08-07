@@ -190,6 +190,10 @@ bool bm6TargetSelected = false;
 volatile bool bm6PollActive = false;
 volatile bool bm6PollResultReady = false;
 bool settingsScanPending = false;
+bool settingsShowingResults = false;
+bool renameActive = false;
+char renameBuffer[16] = "";
+uint8_t renameLength = 0;
 volatile bool settingsScanActive = false;
 volatile bool scanResultsDirty = false;
 uint16_t settingsScanGeneration = 0;
@@ -785,7 +789,8 @@ void drawSavedDeviceBar()
         return;
     }
 
-    const int width = 448 / registry.count();
+    constexpr int tabsWidth = 362;
+    const int width = tabsWidth / registry.count();
     for (uint8_t i = 0; i < registry.count(); ++i) {
         const SavedBm6Device *device = registry.device(i);
         const int x = 16 + i * width;
@@ -794,8 +799,121 @@ void drawSavedDeviceBar()
         gfx->setTextSize(1);
         gfx->setTextColor(active ? COLOR_BLACK : COLOR_WHITE, active ? COLOR_GREEN : COLOR_PANEL);
         gfx->setCursor(x + 7, 76);
-        gfx->printf("%u %.10s", static_cast<unsigned>(i + 1), device->name);
+        gfx->printf("%u %.8s", static_cast<unsigned>(i + 1), device->name);
     }
+
+    gfx->drawRoundRect(386, 66, 78, 26, 5, COLOR_CYAN);
+    gfx->setTextSize(1);
+    gfx->setTextColor(COLOR_WHITE, COLOR_BLACK);
+    gfx->setCursor(404, 76);
+    gfx->print("RENAME");
+}
+
+void drawSettingsHome()
+{
+    clearTextArea(12, 98, 456, 166);
+    const SavedBm6Device *device = registry.active();
+    if (device == nullptr) {
+        gfx->setTextSize(2);
+        gfx->setTextColor(COLOR_MUTED, COLOR_BLACK);
+        gfx->setCursor(18, 116);
+        gfx->print("NO SAVED BM6");
+        return;
+    }
+
+    gfx->setTextSize(1);
+    gfx->setTextColor(COLOR_MUTED, COLOR_BLACK);
+    gfx->setCursor(18, 110);
+    gfx->print("ACTIVE BATTERY");
+    gfx->setTextSize(3);
+    gfx->setTextColor(COLOR_WHITE, COLOR_BLACK);
+    gfx->setCursor(18, 128);
+    gfx->printf("%.15s", device->name);
+
+    gfx->setTextSize(1);
+    gfx->setTextColor(COLOR_MUTED, COLOR_BLACK);
+    gfx->setCursor(18, 166);
+    gfx->print("ADDRESS");
+    gfx->setTextColor(COLOR_WHITE, COLOR_BLACK);
+    gfx->setCursor(92, 166);
+    gfx->print(device->address);
+    gfx->setTextColor(COLOR_MUTED, COLOR_BLACK);
+    gfx->setCursor(18, 186);
+    gfx->print("LAST SIGNAL");
+    gfx->setTextColor(COLOR_WHITE, COLOR_BLACK);
+    gfx->setCursor(110, 186);
+    gfx->printf("%d dBm", device->lastRssi);
+    gfx->setTextColor(COLOR_GREEN, COLOR_BLACK);
+    gfx->fillCircle(22, 220, 3, COLOR_GREEN);
+    gfx->setCursor(34, 216);
+    gfx->print("BACKGROUND UPDATES ACTIVE");
+}
+
+void drawKeyboardKey(int x, int y, int width, const char *label, uint16_t color = COLOR_MUTED)
+{
+    gfx->drawRoundRect(x, y, width, 30, 4, color);
+    gfx->setTextSize(1);
+    gfx->setTextColor(COLOR_WHITE, COLOR_BLACK);
+    const int labelWidth = static_cast<int>(std::strlen(label)) * 6;
+    gfx->setCursor(x + std::max(4, (width - labelWidth) / 2), y + 11);
+    gfx->print(label);
+}
+
+void drawRenameField()
+{
+    gfx->fillRect(13, 41, 454, 30, COLOR_BLACK);
+    gfx->drawRoundRect(12, 40, 456, 32, 5, COLOR_CYAN);
+    gfx->setTextSize(2);
+    gfx->setTextColor(COLOR_WHITE, COLOR_BLACK);
+    gfx->setCursor(20, 48);
+    gfx->printf("%-15s", renameBuffer);
+}
+
+void drawRenameKeyboard()
+{
+    gfx->fillScreen(COLOR_BLACK);
+    gfx->setTextSize(2);
+    gfx->setTextColor(COLOR_WHITE, COLOR_BLACK);
+    gfx->setCursor(12, 12);
+    gfx->print("Rename battery");
+
+    drawRenameField();
+
+    const char *rows[] = {"1234567890", "QWERTYUIOP", "ASDFGHJKL-"};
+    const int rowY[] = {78, 114, 150};
+    char label[2] = {'\0', '\0'};
+    for (uint8_t row = 0; row < 3; ++row) {
+        for (uint8_t key = 0; key < 10; ++key) {
+            label[0] = rows[row][key];
+            drawKeyboardKey(10 + key * 46, rowY[row], 44, label);
+        }
+    }
+
+    const char *lastRow = "ZXCVBNM";
+    for (uint8_t key = 0; key < 7; ++key) {
+        label[0] = lastRow[key];
+        drawKeyboardKey(44 + key * 44, 186, 40, label);
+    }
+    drawKeyboardKey(356, 186, 80, "BACK");
+    drawKeyboardKey(10, 228, 150, "SPACE");
+    drawKeyboardKey(170, 228, 135, "CANCEL", COLOR_AMBER);
+    drawKeyboardKey(315, 228, 155, "SAVE", COLOR_GREEN);
+}
+
+void openRenameKeyboard()
+{
+    const SavedBm6Device *device = registry.active();
+    if (device == nullptr) {
+        drawSettingsStatus("No saved battery to rename");
+        return;
+    }
+    stopSettingsScan();
+    settingsScanPending = false;
+    std::strncpy(renameBuffer, device->name, sizeof(renameBuffer) - 1);
+    renameBuffer[sizeof(renameBuffer) - 1] = '\0';
+    renameLength = static_cast<uint8_t>(std::strlen(renameBuffer));
+    renameActive = true;
+    drawRenameKeyboard();
 }
 
 void copySortedScanDevices(BleScanDevice *devices, uint8_t &deviceCount)
@@ -1067,7 +1185,6 @@ void testSelectedDevice(const BleScanDevice &device)
 void stopSettingsScan()
 {
     if (!settingsScanActive) {
-        NimBLEDevice::getScan()->setMaxResults(0xff);
         return;
     }
 
@@ -1081,12 +1198,35 @@ void stopSettingsScan()
     settingsScanActive = false;
 }
 
-void beginSettingsScan()
+void openSettings()
 {
-    currentScreen = Screen::Settings;
     if (!bm6PollActive) {
         stopSettingsScan();
     }
+    settingsScanPending = false;
+    settingsShowingResults = false;
+    renameActive = false;
+    currentScreen = Screen::Settings;
+    drawSettingsHeader();
+    drawSettingsStatus("BM6 background updates active");
+    drawSavedDeviceBar();
+    drawSettingsHome();
+    Serial.println("Settings opened");
+}
+
+void beginSettingsScan()
+{
+    currentScreen = Screen::Settings;
+    renameActive = false;
+    if (bm6PollActive) {
+        settingsScanPending = true;
+        drawSettingsStatus("Scan queued after battery update");
+        return;
+    }
+
+    stopSettingsScan();
+    settingsScanPending = false;
+    settingsShowingResults = true;
     scanResultsDirty = false;
     settingsPage = 0;
     ++settingsScanGeneration;
@@ -1102,13 +1242,6 @@ void beginSettingsScan()
     drawSavedDeviceBar();
     clearTextArea(12, 98, 456, 134);
 
-    if (bm6PollActive) {
-        settingsScanPending = true;
-        drawSettingsStatus("Finishing battery update, then scanning...");
-        return;
-    }
-
-    settingsScanPending = false;
     Serial.println("Settings BLE scan starting");
 
     bm6.begin();
@@ -1198,7 +1331,7 @@ void bm6PollTask(void *)
 
 void startBm6Poll()
 {
-    if (currentScreen != Screen::Dash || bm6PollActive) {
+    if (bm6PollActive || settingsScanActive || settingsScanPending) {
         return;
     }
     if (!bm6TargetSelected && !hasCompileTimeBm6Address()) {
@@ -1218,7 +1351,11 @@ void startBm6Poll()
 
     bm6PollResultReady = false;
     bm6PollActive = true;
-    setStatus(savedDevice == nullptr ? "Scanning BM6" : "Updating BM6");
+    if (!haveReading) {
+        setStatus(savedDevice == nullptr ? "Scanning BM6" : "Connecting BM6");
+    } else if (std::strcmp(currentStatus, "Starting") == 0) {
+        setStatus("BM6 monitoring");
+    }
     if (xTaskCreatePinnedToCore(bm6PollTask, "bm6-poll", 12288, nullptr, 1, nullptr, 0) != pdPASS) {
         bm6PollActive = false;
         setStatus(haveReading ? "BM6 retry pending" : "BM6 unavailable");
@@ -1258,23 +1395,100 @@ void serviceBm6Poll()
         if (consecutivePollFailures < 255) {
             ++consecutivePollFailures;
         }
-        if (haveReading) {
-            char status[36];
-            snprintf(status, sizeof(status), "BM6 retrying (%u)", consecutivePollFailures);
-            setStatus(status);
-        } else {
+        if (!haveReading) {
             setStatus("BM6 unavailable - retrying");
+        } else if (consecutivePollFailures >= 6) {
+            setStatus("BM6 signal lost - retrying");
         }
         Serial.printf("BM6 update failed: %s\n", pollResultText(result));
         nextPollAtMs = millis() + BM6_RECONNECT_INTERVAL_MS;
     }
 }
 
+void appendRenameCharacter(char character)
+{
+    if (renameLength >= sizeof(renameBuffer) - 1) {
+        return;
+    }
+    renameBuffer[renameLength++] = character;
+    renameBuffer[renameLength] = '\0';
+    drawRenameField();
+}
+
+void finishRename(bool saveName)
+{
+    if (saveName) {
+        while (renameLength > 0 && renameBuffer[renameLength - 1] == ' ') {
+            renameBuffer[--renameLength] = '\0';
+        }
+        if (renameLength == 0 || !registry.rename(registry.activeIndex(), renameBuffer)) {
+            drawRenameField();
+            return;
+        }
+    }
+
+    renameActive = false;
+    openSettings();
+    if (saveName) {
+        drawSettingsStatus("Battery name saved");
+        Serial.printf("Battery renamed to %s\n", renameBuffer);
+    }
+}
+
+void handleRenameTap(const TouchPoint &point)
+{
+    const char *rows[] = {"1234567890", "QWERTYUIOP", "ASDFGHJKL-"};
+    const int rowY[] = {78, 114, 150};
+    for (uint8_t row = 0; row < 3; ++row) {
+        if (point.y < rowY[row] || point.y > rowY[row] + 30 || point.x < 10) {
+            continue;
+        }
+        const int offset = point.x - 10;
+        const uint8_t key = static_cast<uint8_t>(offset / 46);
+        if (key < 10 && offset % 46 < 44) {
+            appendRenameCharacter(rows[row][key]);
+            return;
+        }
+    }
+
+    if (point.y >= 186 && point.y <= 216) {
+        if (point.x >= 44 && point.x < 352) {
+            const int offset = point.x - 44;
+            const uint8_t key = static_cast<uint8_t>(offset / 44);
+            if (key < 7 && offset % 44 < 40) {
+                appendRenameCharacter("ZXCVBNM"[key]);
+            }
+            return;
+        }
+        if (point.x >= 356 && point.x <= 436 && renameLength > 0) {
+            renameBuffer[--renameLength] = '\0';
+            drawRenameField();
+        }
+        return;
+    }
+
+    if (point.y >= 228 && point.y <= 262) {
+        if (point.x >= 10 && point.x <= 160) {
+            if (renameLength > 0 && renameBuffer[renameLength - 1] != ' ') {
+                appendRenameCharacter(' ');
+            }
+        } else if (point.x >= 170 && point.x <= 305) {
+            finishRename(false);
+        } else if (point.x >= 315 && point.x <= 470) {
+            finishRename(true);
+        }
+    }
+}
+
 void handleTouchTap(const TouchPoint &point)
 {
     Serial.printf("Touch %d,%d\n", point.x, point.y);
+    if (currentScreen == Screen::Settings && renameActive) {
+        handleRenameTap(point);
+        return;
+    }
     if (currentScreen == Screen::Dash && point.x >= 438 && point.y <= 40) {
-        beginSettingsScan();
+        openSettings();
         return;
     }
     if (currentScreen == Screen::Dash && point.y <= 42 && point.x <= 34) {
@@ -1315,19 +1529,27 @@ void handleTouchTap(const TouchPoint &point)
         return;
     }
     if (currentScreen == Screen::Settings && point.y >= 64 && point.y <= 96 && registry.count() > 0) {
+        if (point.x >= 386 && point.x <= 464) {
+            openRenameKeyboard();
+            return;
+        }
         if (bm6PollActive) {
             drawSettingsStatus("Waiting for battery update...");
             return;
         }
-        const int width = 448 / registry.count();
-        if (point.x >= 16) {
+        const int width = 362 / registry.count();
+        if (point.x >= 16 && point.x < 378) {
             const uint8_t index = static_cast<uint8_t>((point.x - 16) / width);
             if (index < registry.count() && registry.select(index)) {
                 loadActiveSavedDevice();
                 consecutivePollFailures = 0;
                 nextPollAtMs = millis();
                 drawSavedDeviceBar();
-                drawScanResults();
+                if (settingsShowingResults) {
+                    drawScanResults();
+                } else {
+                    drawSettingsHome();
+                }
                 drawSettingsStatus("Saved battery selected");
             }
         }
@@ -1383,7 +1605,7 @@ void handleSerial()
     }
     const char command = static_cast<char>(Serial.read());
     if (command == 's') {
-        beginSettingsScan();
+        openSettings();
     } else if (command == 'd') {
         stopSettingsScan();
         Serial.println("Settings closed");
@@ -1461,7 +1683,7 @@ void loop()
     }
     serviceSettingsScan();
 
-    if (currentScreen == Screen::Dash && !bm6PollActive &&
+    if (!bm6PollActive && !settingsScanActive && !settingsScanPending &&
         static_cast<int32_t>(now - nextPollAtMs) >= 0) {
         startBm6Poll();
     }
