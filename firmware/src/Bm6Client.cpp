@@ -101,6 +101,19 @@ Bm6PollResult Bm6Client::pollAddress(const char *address, uint8_t addressType, i
     return pollResolvedAddress(target, rssi, reading);
 }
 
+Bm6PollResult Bm6Client::monitorAddress(const char *address, uint8_t addressType, int rssi,
+                                        ReadingHandler handler, void *context,
+                                        const volatile bool *stopRequested)
+{
+    if (!hasAddress(address)) {
+        return Bm6PollResult::NotFound;
+    }
+
+    begin();
+    NimBLEAddress target(std::string(address), addressType);
+    return monitorResolvedAddress(target, rssi, handler, context, stopRequested);
+}
+
 void Bm6Client::setPreferredAddress(const char *address, uint8_t addressType)
 {
     if (!hasAddress(address)) {
@@ -212,6 +225,125 @@ Bm6PollResult Bm6Client::pollResolvedAddress(const NimBLEAddress &address, int r
     return result;
 }
 
+Bm6PollResult Bm6Client::monitorResolvedAddress(const NimBLEAddress &address, int rssi,
+                                                ReadingHandler handler, void *context,
+                                                const volatile bool *stopRequested)
+{
+    NimBLEClient *client = NimBLEDevice::createClient();
+    if (client == nullptr) {
+        return Bm6PollResult::ConnectFailed;
+    }
+
+    client->setConnectTimeout(BM6_CONNECT_TIMEOUT_MS);
+    client->setConnectRetries(0);
+    Bm6PollResult result = Bm6PollResult::Ok;
+    bool connected = false;
+    for (uint8_t attempt = 0;
+         attempt < BM6_CONNECT_ATTEMPTS && !connected &&
+         (stopRequested == nullptr || !*stopRequested);
+         ++attempt) {
+        connected = client->connect(address);
+        if (!connected) {
+            Serial.printf("BM6 connect attempt %u failed for %s\n",
+                          static_cast<unsigned>(attempt + 1), address.toString().c_str());
+            delay(350);
+        }
+    }
+
+    if (stopRequested != nullptr && *stopRequested) {
+        result = Bm6PollResult::Stopped;
+    } else if (!connected) {
+        result = Bm6PollResult::ConnectFailed;
+    } else {
+        delay(150);
+        NimBLERemoteService *service = client->getService(SERVICE_UUID);
+        if (service == nullptr) {
+            result = Bm6PollResult::ServiceMissing;
+        } else {
+            NimBLERemoteCharacteristic *writer = service->getCharacteristic(WRITE_UUID);
+            NimBLERemoteCharacteristic *notifier = service->getCharacteristic(NOTIFY_UUID);
+            if (writer == nullptr || notifier == nullptr) {
+                result = Bm6PollResult::CharacteristicMissing;
+            } else {
+                packetReady_ = false;
+                const bool subscribed = notifier->subscribe(true, [this](
+                    NimBLERemoteCharacteristic *, uint8_t *data, size_t length, bool
+                ) {
+                    handleNotification(data, length);
+                });
+
+                if (!subscribed) {
+                    result = Bm6PollResult::SubscribeFailed;
+                } else if (!writer->writeValue(READ_COMMAND, sizeof(READ_COMMAND), true)) {
+                    result = Bm6PollResult::WriteFailed;
+                } else {
+                    const uint32_t started = millis();
+                    uint32_t lastValidPacketAt = started;
+                    uint32_t lastRssiAt = 0;
+                    int connectedRssi = rssi;
+                    bool receivedReading = false;
+                    result = Bm6PollResult::Timeout;
+
+                    while (client->isConnected() &&
+                           (stopRequested == nullptr || !*stopRequested)) {
+                        if (packetReady_) {
+                            uint8_t packet[sizeof(encryptedPacket_)];
+                            packetReady_ = false;
+                            std::memcpy(packet, encryptedPacket_, sizeof(packet));
+                            BatteryReading reading;
+                            if (packetToReading(packet, sizeof(packet), reading)) {
+                                const uint32_t now = millis();
+                                if (lastRssiAt == 0 || now - lastRssiAt >= 10000UL) {
+                                    const int refreshedRssi = client->getRssi();
+                                    if (refreshedRssi != 0) {
+                                        connectedRssi = refreshedRssi;
+                                    }
+                                    lastRssiAt = now;
+                                }
+                                reading.rssi = connectedRssi;
+                                reading.sampledAtMs = now;
+                                receivedReading = true;
+                                lastValidPacketAt = now;
+                                result = Bm6PollResult::Ok;
+                                if (handler != nullptr) {
+                                    handler(reading, context);
+                                }
+                            }
+                        }
+
+                        const uint32_t now = millis();
+                        const uint32_t timeoutFrom = receivedReading ? lastValidPacketAt : started;
+                        if (now - timeoutFrom >= BM6_STREAM_TIMEOUT_MS) {
+                            result = Bm6PollResult::Timeout;
+                            break;
+                        }
+                        delay(10);
+                    }
+
+                    if (stopRequested != nullptr && *stopRequested) {
+                        result = Bm6PollResult::Stopped;
+                    } else if (!client->isConnected() && result == Bm6PollResult::Ok) {
+                        result = Bm6PollResult::ConnectFailed;
+                    }
+                    if (client->isConnected()) {
+                        notifier->unsubscribe(false);
+                    }
+                }
+            }
+        }
+    }
+
+    if (client->isConnected()) {
+        client->disconnect();
+    }
+    if (result == Bm6PollResult::Ok || result == Bm6PollResult::Stopped) {
+        std::strncpy(lastAddress_, address.toString().c_str(), sizeof(lastAddress_) - 1);
+        lastAddress_[sizeof(lastAddress_) - 1] = '\0';
+    }
+    NimBLEDevice::deleteClient(client);
+    return result;
+}
+
 const char *Bm6Client::lastDeviceAddress() const
 {
     return lastAddress_;
@@ -278,11 +410,6 @@ bool Bm6Client::packetToReading(const uint8_t *encrypted, size_t length, Battery
     }
 
     if (decrypted[0] != 0xd1 || decrypted[1] != 0x55 || decrypted[2] != 0x07) {
-        Serial.print("BM6 ignored decrypted packet:");
-        for (size_t i = 0; i < length; ++i) {
-            Serial.printf(" %02x", decrypted[i]);
-        }
-        Serial.println();
         return false;
     }
 

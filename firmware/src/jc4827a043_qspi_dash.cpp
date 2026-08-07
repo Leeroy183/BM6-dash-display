@@ -191,6 +191,7 @@ uint32_t lastTouchContactAtMs = 0;
 bool bm6TargetSelected = false;
 volatile bool bm6PollActive = false;
 volatile bool bm6PollResultReady = false;
+volatile bool bm6StopRequested = false;
 bool settingsScanPending = false;
 bool settingsShowingResults = false;
 bool renameActive = false;
@@ -210,6 +211,8 @@ Screen currentScreen = Screen::Dash;
 DashPage dashPage = DashPage::Overview;
 HistoryRange historyRange = HistoryRange::ThreeDays;
 uint8_t consecutivePollFailures = 0;
+int8_t pendingSavedDeviceIndex = -1;
+int8_t pendingRelativeSelection = 0;
 
 struct Bm6PollJob {
     char address[18] = "";
@@ -222,6 +225,8 @@ portMUX_TYPE bm6PollMux = portMUX_INITIALIZER_UNLOCKED;
 Bm6PollJob bm6PollJob;
 BatteryReading bm6PendingReading;
 Bm6PollResult bm6PendingResult = Bm6PollResult::NotFound;
+volatile uint32_t bm6PendingReadingSequence = 0;
+uint32_t bm6HandledReadingSequence = 0;
 
 struct RecentVoltageSeries {
     uint16_t values[OVERVIEW_SAMPLE_COUNT] = {};
@@ -400,6 +405,8 @@ const char *pollResultText(Bm6PollResult result)
     switch (result) {
         case Bm6PollResult::Ok:
             return "BM6 connected";
+        case Bm6PollResult::Stopped:
+            return "BM6 monitor stopped";
         case Bm6PollResult::NotFound:
             return "BM6 not found";
         case Bm6PollResult::ConnectFailed:
@@ -699,6 +706,64 @@ void drawOverview()
     gfx->setTextColor(COLOR_MUTED, COLOR_PANEL_LIGHT);
     gfx->setCursor(220, 139);
     gfx->print("10 MIN VOLTAGE");
+}
+
+void drawOverviewLiveValues()
+{
+    if (currentScreen != Screen::Dash || dashPage != DashPage::Overview) {
+        return;
+    }
+
+    gfx->fillRect(20, 76, 170, 50, COLOR_PANEL_LIGHT);
+    gfx->setTextSize(5);
+    gfx->setTextColor(haveReading ? COLOR_WHITE : COLOR_MUTED, COLOR_PANEL_LIGHT);
+    gfx->setCursor(31, 82);
+    if (haveReading) {
+        gfx->printf("%u%%", latestReading.socPercent);
+    } else {
+        gfx->print("--%");
+    }
+
+    gfx->fillRect(22, 137, 162, 14, COLOR_PANEL_LIGHT);
+    if (haveReading) {
+        const int fill = std::max(0, std::min(162, static_cast<int>(latestReading.socPercent) * 162 / 100));
+        gfx->fillRoundRect(22, 137, fill, 14, 3, voltageColor(latestReading.voltage));
+    }
+
+    gfx->fillRect(20, 160, 170, 30, COLOR_PANEL_LIGHT);
+    gfx->setTextSize(2);
+    gfx->setTextColor(haveReading && latestReading.voltage >= 13.3f ? COLOR_GREEN : COLOR_MUTED,
+                      COLOR_PANEL_LIGHT);
+    gfx->setCursor(20, 165);
+    gfx->print(haveReading && latestReading.voltage >= 13.3f ? "CHARGING" : "RESTING");
+
+    gfx->fillRect(20, 198, 178, 18, COLOR_PANEL_LIGHT);
+    gfx->setTextSize(1);
+    gfx->setTextColor(COLOR_MUTED, COLOR_PANEL_LIGHT);
+    gfx->setCursor(20, 201);
+    gfx->printf("RSSI %d dBm   %u samples", haveReading ? latestReading.rssi : -127,
+                static_cast<unsigned>(history.size()));
+
+    gfx->fillRect(220, 74, 158, 46, COLOR_PANEL_LIGHT);
+    gfx->setTextSize(4);
+    gfx->setTextColor(haveReading ? voltageColor(latestReading.voltage) : COLOR_MUTED,
+                      COLOR_PANEL_LIGHT);
+    gfx->setCursor(224, 76);
+    if (haveReading) {
+        gfx->printf("%.2fV", latestReading.voltage);
+    } else {
+        gfx->print("--.--V");
+    }
+
+    gfx->fillRect(380, 78, 86, 38, COLOR_PANEL_LIGHT);
+    gfx->setTextSize(2);
+    gfx->setTextColor(COLOR_CYAN, COLOR_PANEL_LIGHT);
+    gfx->setCursor(382, 84);
+    if (haveReading) {
+        gfx->printf("%dC", latestReading.temperatureC);
+    } else {
+        gfx->print("--C");
+    }
 }
 
 void drawHistoryPage()
@@ -1192,8 +1257,10 @@ bool loadActiveSavedDevice()
 bool selectSavedDeviceRelative(int8_t direction)
 {
     if (bm6PollActive) {
-        setStatus("Battery update in progress");
-        return false;
+        pendingRelativeSelection = direction;
+        bm6StopRequested = true;
+        setStatus("Switching battery");
+        return true;
     }
     if (!registry.selectRelative(direction)) {
         return false;
@@ -1203,6 +1270,44 @@ bool selectSavedDeviceRelative(int8_t direction)
     nextPollAtMs = millis();
     redrawDashboard();
     return true;
+}
+
+void servicePendingDeviceSelection()
+{
+    if (bm6PollActive) {
+        return;
+    }
+
+    if (pendingRelativeSelection != 0) {
+        const int8_t direction = pendingRelativeSelection;
+        pendingRelativeSelection = 0;
+        selectSavedDeviceRelative(direction);
+        return;
+    }
+
+    if (pendingSavedDeviceIndex < 0) {
+        return;
+    }
+
+    const uint8_t index = static_cast<uint8_t>(pendingSavedDeviceIndex);
+    pendingSavedDeviceIndex = -1;
+    if (!registry.select(index)) {
+        return;
+    }
+    loadActiveSavedDevice();
+    consecutivePollFailures = 0;
+    nextPollAtMs = millis();
+    if (currentScreen == Screen::Settings) {
+        drawSavedDeviceBar();
+        if (settingsShowingResults) {
+            drawScanResults();
+        } else {
+            drawSettingsHome();
+        }
+        drawSettingsStatus("Saved battery selected");
+    } else {
+        redrawDashboard();
+    }
 }
 
 bool saveSelectedBm6(const BleScanDevice &device)
@@ -1315,7 +1420,8 @@ void beginSettingsScan()
     renameActive = false;
     if (bm6PollActive) {
         settingsScanPending = true;
-        drawSettingsStatus("Scan queued after battery update");
+        bm6StopRequested = true;
+        drawSettingsStatus("Pausing BM6 link for scan...");
         return;
     }
 
@@ -1401,22 +1507,22 @@ void serviceSettingsScan()
     }
 }
 
-void bm6PollTask(void *)
+void queueBm6StreamReading(const BatteryReading &reading, void *)
 {
-    BatteryReading reading;
-    Bm6PollResult result = bm6PollJob.useDirectAddress
-        ? bm6.pollAddress(bm6PollJob.address, bm6PollJob.addressType, bm6PollJob.rssi, reading)
-        : bm6.poll(reading);
-
-    // A saved address normally reconnects fastest directly. If that fails, an
-    // advertisement scan refreshes the address type and wakes less-cooperative units.
-    if (bm6PollJob.useDirectAddress && result != Bm6PollResult::Ok) {
-        Serial.printf("Direct BM6 poll failed (%s), trying scan fallback\n", pollResultText(result));
-        result = bm6.poll(reading);
-    }
-
     portENTER_CRITICAL(&bm6PollMux);
     bm6PendingReading = reading;
+    ++bm6PendingReadingSequence;
+    portEXIT_CRITICAL(&bm6PollMux);
+}
+
+void bm6PollTask(void *)
+{
+    const Bm6PollResult result = bm6.monitorAddress(
+        bm6PollJob.address, bm6PollJob.addressType, bm6PollJob.rssi,
+        queueBm6StreamReading, nullptr, &bm6StopRequested
+    );
+
+    portENTER_CRITICAL(&bm6PollMux);
     bm6PendingResult = result;
     bm6PollResultReady = true;
     bm6PollActive = false;
@@ -1442,9 +1548,14 @@ void startBm6Poll()
         bm6PollJob.addressType = savedDevice->addressType;
         bm6PollJob.rssi = savedDevice->lastRssi;
         bm6PollJob.useDirectAddress = true;
+    } else if (hasCompileTimeBm6Address()) {
+        std::strncpy(bm6PollJob.address, BM6_MAC_ADDRESS, sizeof(bm6PollJob.address) - 1);
+        bm6PollJob.addressType = 1;
+        bm6PollJob.useDirectAddress = true;
     }
 
     bm6PollResultReady = false;
+    bm6StopRequested = false;
     bm6PollActive = true;
     if (!haveReading) {
         setStatus(savedDevice == nullptr ? "Scanning BM6" : "Connecting BM6");
@@ -1461,32 +1572,44 @@ void startBm6Poll()
 
 void serviceBm6Poll()
 {
-    if (!bm6PollResultReady) {
-        return;
-    }
-
     BatteryReading reading;
-    Bm6PollResult result;
+    uint32_t readingSequence = bm6HandledReadingSequence;
     portENTER_CRITICAL(&bm6PollMux);
-    reading = bm6PendingReading;
-    result = bm6PendingResult;
-    bm6PollResultReady = false;
+    if (bm6PendingReadingSequence != bm6HandledReadingSequence) {
+        reading = bm6PendingReading;
+        readingSequence = bm6PendingReadingSequence;
+    }
     portEXIT_CRITICAL(&bm6PollMux);
 
-    if (result == Bm6PollResult::Ok) {
+    if (readingSequence != bm6HandledReadingSequence) {
+        bm6HandledReadingSequence = readingSequence;
         consecutivePollFailures = 0;
         latestReading = reading;
         haveReading = true;
         history.addIfDue(reading);
         activeOverviewSeries().add(reading);
         registry.updateRssi(registry.activeIndex(), reading.rssi);
-        setStatus("BM6 connected");
-        if (currentScreen == Screen::Dash) {
-            drawDashboardPage();
+        if (std::strcmp(currentStatus, "BM6 connected") != 0) {
+            setStatus("BM6 connected");
         }
+        drawOverviewLiveValues();
         Serial.printf("BM6 %.2fV %u%% %dC RSSI %d\n",
                       reading.voltage, reading.socPercent, reading.temperatureC, reading.rssi);
-        nextPollAtMs = millis() + BM6_POLL_INTERVAL_MS;
+    }
+
+    if (!bm6PollResultReady) {
+        return;
+    }
+
+    Bm6PollResult result;
+    portENTER_CRITICAL(&bm6PollMux);
+    result = bm6PendingResult;
+    bm6PollResultReady = false;
+    portEXIT_CRITICAL(&bm6PollMux);
+
+    if (result == Bm6PollResult::Stopped) {
+        Serial.println("BM6 background monitor paused");
+        nextPollAtMs = millis();
     } else {
         if (consecutivePollFailures < 255) {
             ++consecutivePollFailures;
@@ -1616,6 +1739,7 @@ void handleTouchTap(const TouchPoint &point)
     }
     if (currentScreen == Screen::Settings && point.x >= 8 && point.x <= 42 && point.y >= 6 && point.y <= 36) {
         stopSettingsScan();
+        settingsShowingResults = false;
         Serial.println("Settings closed");
         redrawDashboard();
         return;
@@ -1630,7 +1754,15 @@ void handleTouchTap(const TouchPoint &point)
             return;
         }
         if (bm6PollActive) {
-            drawSettingsStatus("Waiting for battery update...");
+            const int width = 362 / registry.count();
+            if (point.x >= 16 && point.x < 378) {
+                const uint8_t index = static_cast<uint8_t>((point.x - 16) / width);
+                if (index < registry.count()) {
+                    pendingSavedDeviceIndex = static_cast<int8_t>(index);
+                    bm6StopRequested = true;
+                    drawSettingsStatus("Switching saved battery...");
+                }
+            }
             return;
         }
         const int width = 362 / registry.count();
@@ -1704,6 +1836,7 @@ void handleSerial()
         openSettings();
     } else if (command == 'd') {
         stopSettingsScan();
+        settingsShowingResults = false;
         Serial.println("Settings closed");
         redrawDashboard();
     } else if (command == '[' && currentScreen == Screen::Dash) {
@@ -1774,12 +1907,13 @@ void loop()
     handleSerial();
     handleTouch();
     serviceBm6Poll();
+    servicePendingDeviceSelection();
     if (settingsScanPending && !bm6PollActive && currentScreen == Screen::Settings) {
         beginSettingsScan();
     }
     serviceSettingsScan();
 
-    if (!bm6PollActive && !settingsScanActive && !settingsScanPending &&
+    if (!bm6PollActive && !settingsScanActive && !settingsScanPending && !settingsShowingResults &&
         static_cast<int32_t>(now - nextPollAtMs) >= 0) {
         startBm6Poll();
     }

@@ -7,7 +7,7 @@ the BM6 phone app.
 ## What it does now
 
 - scans for a BM6 over BLE
-- connects and requests the live battery packet
+- keeps a BLE connection open and consumes live battery updates at about 1 Hz
 - decrypts the BM6 response on the ESP32
 - shows voltage, state of charge, temperature, and connection status
 - keeps a persistent 3-day rolling history and plots it on the display
@@ -17,7 +17,8 @@ the BM6 phone app.
 History is stored as small, wear-conscious chunks in a dedicated 128 KB ESP32
 NVS partition. The current single-battery configuration stores 864 five-minute
 samples, covering 3 days of voltage, state of charge, and temperature while the
-dash firmware is polling the BM6. The selected BM6 address remains in the
+dash firmware is connected to the BM6. The live values update every packet,
+while only one five-minute sample is written to flash. The selected BM6 address remains in the
 standard NVS partition, so firmware updates do not require selecting it again.
 
 ## Hardware targets
@@ -44,7 +45,7 @@ Edit `src/config.h` before flashing:
 
 - `BM6_MAC_ADDRESS`: set this to your BM6 MAC address for faster and more
   reliable pairing. Leave it as `00:00:00:00:00:00` to scan for the name `BM6`.
-- `BM6_POLL_INTERVAL_MS`: how often to poll while the dash is powered.
+- `BM6_STREAM_TIMEOUT_MS`: how long to wait without a valid live packet before reconnecting.
 - voltage warning/critical thresholds for the screen colors.
 
 Keep the BM6 phone app closed while testing. The monitor normally expects a
@@ -119,7 +120,7 @@ the spare BM6 unpowered, then power the BM6 from a 12 V bench supply and scan
 again. Devices first seen in the second scan are marked `NEW`; the new or
 strongest nearby unnamed device is usually the BM6. Tap a device row to test it
 with the BM6 read command. If the read succeeds, the dash saves that address and
-uses it for future polling. Rows with obvious medical device names such as pumps
+uses it for future background monitoring. Rows with obvious medical device names such as pumps
 or Dexcom are shown but skipped by the test action.
 
 If touch calibration needs work, use serial commands while monitoring at 115200

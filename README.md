@@ -6,7 +6,7 @@ BM6 Bluetooth car battery monitors from an ESP32-S3 touch display.
 ## Project goals
 
 - run standalone in the vehicle without Home Assistant, ESPHome, or Wi-Fi
-- support multiple BM6 battery monitors by polling them sequentially over BLE
+- save multiple BM6 monitors and keep a persistent BLE stream to the selected battery
 - show live voltage, state of charge, temperature, status, and warning states
 - keep local history per battery for trend and fault review
 - provide printable enclosure STL files and editable CAD source files
