@@ -121,24 +121,22 @@ int PersistentHistory::voltageHundredthsForChart(
 ) const
 {
     const size_t sampleCount = recentSampleCount(recentSamples);
-    if (sampleCount == 0 || pointCount == 0) {
+    if (sampleCount == 0 || pointCount == 0 || recentSamples == 0) {
         return -1;
     }
 
-    size_t logicalIndex = 0;
-    if (sampleCount <= pointCount) {
-        const uint16_t emptyPrefix = pointCount - sampleCount;
-        if (pointIndex < emptyPrefix) {
-            return -1;
-        }
-        logicalIndex = state_.count - sampleCount + pointIndex - emptyPrefix;
-    } else if (pointCount == 1) {
-        logicalIndex = state_.count - 1;
-    } else {
-        logicalIndex = state_.count - sampleCount + static_cast<size_t>(
-            std::lround((static_cast<double>(pointIndex) * (sampleCount - 1)) / (pointCount - 1)));
+    const size_t rangeSlot = pointCount == 1
+        ? recentSamples - 1
+        : static_cast<size_t>(std::lround(
+            (static_cast<double>(pointIndex) * (recentSamples - 1)) / (pointCount - 1)
+        ));
+    const size_t emptySlots = recentSamples - sampleCount;
+    if (rangeSlot < emptySlots) {
+        return -1;
     }
 
+    const size_t sampleOffset = std::min(sampleCount - 1, rangeSlot - emptySlots);
+    const size_t logicalIndex = state_.count - sampleCount + sampleOffset;
     return state_.samples[physicalIndexFromOldest(logicalIndex)].voltageCenti;
 }
 

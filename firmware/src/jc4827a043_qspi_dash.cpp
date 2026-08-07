@@ -4,6 +4,7 @@
 #include <Wire.h>
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstring>
 #include <strings.h>
 #include <string>
@@ -37,6 +38,7 @@ constexpr uint8_t GT911_ADDR_2 = 0x14;
 constexpr uint16_t GT911_POINT_STATUS = 0x814e;
 constexpr uint8_t MAX_SCAN_DEVICES = 32;
 constexpr uint8_t SETTINGS_ROWS_PER_PAGE = 7;
+constexpr size_t OVERVIEW_SAMPLE_COUNT = 11;
 
 Arduino_DataBus *bus = new Arduino_ESP32QSPI(
     45 /* CS */, 47 /* SCK */, 21 /* D0 */, 48 /* D1 */, 40 /* D2 */, 39 /* D3 */
@@ -220,6 +222,49 @@ portMUX_TYPE bm6PollMux = portMUX_INITIALIZER_UNLOCKED;
 Bm6PollJob bm6PollJob;
 BatteryReading bm6PendingReading;
 Bm6PollResult bm6PendingResult = Bm6PollResult::NotFound;
+
+struct RecentVoltageSeries {
+    uint16_t values[OVERVIEW_SAMPLE_COUNT] = {};
+    uint8_t next = 0;
+    uint8_t count = 0;
+    uint32_t lastSampleAtMs = 0;
+
+    void add(const BatteryReading &reading)
+    {
+        const uint16_t voltageCenti = static_cast<uint16_t>(std::lround(reading.voltage * 100.0f));
+        const uint32_t now = millis();
+        if (count > 0 && now - lastSampleAtMs < 45000UL) {
+            values[(next + OVERVIEW_SAMPLE_COUNT - 1) % OVERVIEW_SAMPLE_COUNT] = voltageCenti;
+            return;
+        }
+        values[next] = voltageCenti;
+        next = (next + 1) % OVERVIEW_SAMPLE_COUNT;
+        if (count < OVERVIEW_SAMPLE_COUNT) {
+            ++count;
+        }
+        lastSampleAtMs = now;
+    }
+
+    int voltageForChart(uint16_t pointIndex, uint16_t pointCount) const
+    {
+        if (count == 0 || pointCount == 0) {
+            return -1;
+        }
+        const size_t rangeSlot = pointCount == 1
+            ? OVERVIEW_SAMPLE_COUNT - 1
+            : (static_cast<size_t>(pointIndex) * (OVERVIEW_SAMPLE_COUNT - 1) +
+               (pointCount - 1) / 2) / (pointCount - 1);
+        const size_t emptySlots = OVERVIEW_SAMPLE_COUNT - count;
+        if (rangeSlot < emptySlots) {
+            return -1;
+        }
+        const size_t sampleOffset = std::min<size_t>(count - 1, rangeSlot - emptySlots);
+        const size_t oldest = count == OVERVIEW_SAMPLE_COUNT ? next : 0;
+        return values[(oldest + sampleOffset) % OVERVIEW_SAMPLE_COUNT];
+    }
+};
+
+RecentVoltageSeries overviewSeries[MAX_SAVED_BM6_DEVICES];
 
 class SettingsScanCallbacks : public NimBLEScanCallbacks {
   public:
@@ -406,6 +451,13 @@ const char *activeBatteryName()
     return device == nullptr ? "No battery" : device->name;
 }
 
+RecentVoltageSeries &activeOverviewSeries()
+{
+    const SavedBm6Device *device = registry.active();
+    const uint8_t slot = device == nullptr ? 0 : device->historySlot;
+    return overviewSeries[std::min<uint8_t>(slot, MAX_SAVED_BM6_DEVICES - 1)];
+}
+
 size_t historySamplesForRange()
 {
     switch (historyRange) {
@@ -540,6 +592,45 @@ void drawChart(int x0, int y0, int w, int h, size_t recentSamples, bool grid)
     }
 }
 
+void drawOverviewChart(int x0, int y0, int w, int h)
+{
+    gfx->fillRect(x0, y0, w, h, COLOR_PANEL_LIGHT);
+    gfx->drawRect(x0, y0, w, h, COLOR_MUTED);
+    for (uint8_t i = 1; i < 4; ++i) {
+        gfx->drawFastHLine(x0 + 1, y0 + i * h / 4, w - 2, COLOR_PANEL);
+    }
+    for (uint8_t i = 1; i < 5; ++i) {
+        gfx->drawFastVLine(x0 + i * w / 5, y0 + 1, h - 2, COLOR_PANEL);
+    }
+
+    const RecentVoltageSeries &series = activeOverviewSeries();
+    if (series.count == 0) {
+        gfx->setTextSize(1);
+        gfx->setTextColor(COLOR_MUTED, COLOR_PANEL_LIGHT);
+        gfx->setCursor(x0 + 12, y0 + h / 2 - 4);
+        gfx->print("WAITING FOR LIVE DATA");
+        return;
+    }
+
+    constexpr int minCenti = 800;
+    constexpr int maxCenti = 1600;
+    int lastX = -1;
+    int lastY = -1;
+    for (int x = 0; x < w - 2; ++x) {
+        const int value = series.voltageForChart(x, w - 2);
+        if (value < 0) {
+            continue;
+        }
+        const int clamped = std::max(minCenti, std::min(maxCenti, value));
+        const int y = y0 + h - 2 - ((clamped - minCenti) * (h - 4) / (maxCenti - minCenti));
+        if (lastX >= 0) {
+            gfx->drawLine(lastX, lastY, x0 + 1 + x, y, COLOR_GREEN);
+        }
+        lastX = x0 + 1 + x;
+        lastY = y;
+    }
+}
+
 void drawOverview()
 {
     gfx->fillRect(0, 42, SCREEN_WIDTH, 196, COLOR_BACKGROUND);
@@ -603,11 +694,11 @@ void drawOverview()
         gfx->print("--C");
     }
 
-    drawChart(210, 133, 262, 96, 6UL * 60UL / 5UL, true);
+    drawOverviewChart(210, 133, 262, 96);
     gfx->setTextSize(1);
     gfx->setTextColor(COLOR_MUTED, COLOR_PANEL_LIGHT);
     gfx->setCursor(220, 139);
-    gfx->print("6 HOUR VOLTAGE");
+    gfx->print("10 MIN VOLTAGE");
 }
 
 void drawHistoryPage()
@@ -1089,6 +1180,9 @@ bool loadActiveSavedDevice()
     if (haveReading && latestReading.rssi == 0) {
         latestReading.rssi = device->lastRssi;
     }
+    if (haveReading && activeOverviewSeries().count == 0) {
+        activeOverviewSeries().add(latestReading);
+    }
     bm6TargetSelected = true;
     Serial.printf("Active BM6 %s %s type %u history %u\n", device->name, device->address,
                   device->addressType, device->historySlot);
@@ -1174,6 +1268,7 @@ void testSelectedDevice(const BleScanDevice &device)
     latestReading = reading;
     haveReading = true;
     history.addIfDue(reading);
+    activeOverviewSeries().add(reading);
 
     char buffer[64];
     snprintf(buffer, sizeof(buffer), "Saved BM6 %s %.2fV", device.address, reading.voltage);
@@ -1383,6 +1478,7 @@ void serviceBm6Poll()
         latestReading = reading;
         haveReading = true;
         history.addIfDue(reading);
+        activeOverviewSeries().add(reading);
         registry.updateRssi(registry.activeIndex(), reading.rssi);
         setStatus("BM6 connected");
         if (currentScreen == Screen::Dash) {
