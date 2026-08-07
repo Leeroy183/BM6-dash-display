@@ -45,6 +45,16 @@ capture an Android Bluetooth HCI log while the official app performs a history
 sync, then decrypt writes to `FFF3` and notifications from `FFF4` with the known
 AES key.
 
+Once those commands are confirmed, the dash startup sequence will be:
+
+1. Connect to the selected BM6 when accessory power turns on.
+2. Start the 1 Hz live stream immediately so the dashboard is responsive.
+3. Request all onboard records newer than the newest stored BM6 timestamp.
+4. Import voltage history and cranking waveforms into their separate per-device
+   stores, ignoring duplicate timestamps.
+5. Resume an interrupted download after the next reconnect rather than erasing
+   already imported records.
+
 ## References
 
 - https://github.com/JeffWDH/bm6-battery-monitor

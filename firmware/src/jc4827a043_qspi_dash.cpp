@@ -44,6 +44,9 @@ Arduino_DataBus *bus = new Arduino_ESP32QSPI(
     45 /* CS */, 47 /* SCK */, 21 /* D0 */, 48 /* D1 */, 40 /* D2 */, 39 /* D3 */
 );
 Arduino_GFX *gfx = new Arduino_NV3041A(bus, GFX_NOT_DEFINED /* RST */, 0 /* rotation */, true /* IPS */);
+Arduino_Canvas *liveLeftCanvas = new Arduino_Canvas(178, 140, gfx, 20, 76);
+Arduino_Canvas *liveRightCanvas = new Arduino_Canvas(246, 46, gfx, 220, 74);
+bool liveCanvasesReady = false;
 
 struct TouchPoint {
     int16_t x = 0;
@@ -204,7 +207,6 @@ uint8_t settingsPage = 0;
 uint32_t settingsScanStartedAtMs = 0;
 uint32_t lastScanDrawMs = 0;
 uint32_t nextPollAtMs = 0;
-uint32_t lastUiTickMs = 0;
 uint32_t lastChartDrawMs = 0;
 char currentStatus[36] = "Starting";
 Screen currentScreen = Screen::Dash;
@@ -711,6 +713,59 @@ void drawOverview()
 void drawOverviewLiveValues()
 {
     if (currentScreen != Screen::Dash || dashPage != DashPage::Overview) {
+        return;
+    }
+
+    if (liveCanvasesReady) {
+        liveLeftCanvas->fillScreen(COLOR_PANEL_LIGHT);
+        liveLeftCanvas->setTextSize(5);
+        liveLeftCanvas->setTextColor(haveReading ? COLOR_WHITE : COLOR_MUTED, COLOR_PANEL_LIGHT);
+        liveLeftCanvas->setCursor(11, 6);
+        if (haveReading) {
+            liveLeftCanvas->printf("%u%%", latestReading.socPercent);
+        } else {
+            liveLeftCanvas->print("--%");
+        }
+
+        liveLeftCanvas->drawRoundRect(0, 59, 166, 18, 4, COLOR_MUTED);
+        if (haveReading) {
+            const int fill = std::max(0, std::min(162, static_cast<int>(latestReading.socPercent) * 162 / 100));
+            liveLeftCanvas->fillRoundRect(2, 61, fill, 14, 3, voltageColor(latestReading.voltage));
+        }
+
+        liveLeftCanvas->setTextSize(2);
+        liveLeftCanvas->setTextColor(
+            haveReading && latestReading.voltage >= 13.3f ? COLOR_GREEN : COLOR_MUTED,
+            COLOR_PANEL_LIGHT
+        );
+        liveLeftCanvas->setCursor(0, 89);
+        liveLeftCanvas->print(haveReading && latestReading.voltage >= 13.3f ? "CHARGING" : "RESTING");
+        liveLeftCanvas->setTextSize(1);
+        liveLeftCanvas->setTextColor(COLOR_MUTED, COLOR_PANEL_LIGHT);
+        liveLeftCanvas->setCursor(0, 125);
+        liveLeftCanvas->printf("RSSI %d dBm   %u samples", haveReading ? latestReading.rssi : -127,
+                               static_cast<unsigned>(history.size()));
+        liveLeftCanvas->flush();
+
+        liveRightCanvas->fillScreen(COLOR_PANEL_LIGHT);
+        liveRightCanvas->setTextSize(4);
+        liveRightCanvas->setTextColor(haveReading ? voltageColor(latestReading.voltage) : COLOR_MUTED,
+                                      COLOR_PANEL_LIGHT);
+        liveRightCanvas->setCursor(4, 2);
+        if (haveReading) {
+            liveRightCanvas->printf("%.2fV", latestReading.voltage);
+        } else {
+            liveRightCanvas->print("--.--V");
+        }
+        liveRightCanvas->setTextSize(2);
+        liveRightCanvas->setTextColor(COLOR_CYAN, COLOR_PANEL_LIGHT);
+        liveRightCanvas->setCursor(162, 10);
+        if (haveReading) {
+            liveRightCanvas->printf("%dC", latestReading.temperatureC);
+        } else {
+            liveRightCanvas->print("--C");
+        }
+        liveRightCanvas->flush();
         return;
     }
 
@@ -1881,6 +1936,9 @@ void setup()
     }
     gfx->invertDisplay(false);
     gfx->setRotation(DISPLAY_ROTATION);
+    liveCanvasesReady = liveLeftCanvas->begin(GFX_SKIP_OUTPUT_BEGIN) &&
+                        liveRightCanvas->begin(GFX_SKIP_OUTPUT_BEGIN);
+    Serial.printf("Buffered live updates %s\n", liveCanvasesReady ? "ready" : "unavailable");
     touch.begin();
 
     registry.begin();
@@ -1916,10 +1974,6 @@ void loop()
     if (!bm6PollActive && !settingsScanActive && !settingsScanPending && !settingsShowingResults &&
         static_cast<int32_t>(now - nextPollAtMs) >= 0) {
         startBm6Poll();
-    }
-    if (currentScreen == Screen::Dash && now - lastUiTickMs >= 1000) {
-        drawStatus();
-        lastUiTickMs = now;
     }
     if (currentScreen == Screen::Dash && now - lastChartDrawMs >= 60000) {
         if (dashPage == DashPage::Overview) {
